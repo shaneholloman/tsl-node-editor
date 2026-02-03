@@ -31,6 +31,9 @@ import {
 } from 'three/webgpu'
 import WebGPU from 'three/addons/capabilities/WebGPU.js'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
+import { THREEMaterialsTSLExporterPlugin } from '@takahirox/gltf-three-materials-tsl-exporter'
+import { createDefaultNodeSerializer } from './tslGltfExporter'
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js'
 import {
   acesFilmicToneMapping,
@@ -451,9 +454,10 @@ function App() {
   const [showCode, setShowCode] = useState(false)
   const [showNodes, setShowNodes] = useState(true)
   const [tslPanelMode, setTslPanelMode] = useState<'code' | 'viewer'>('code')
-  const [tslOutputKind, setTslOutputKind] = useState<'tsl' | 'material' | 'app'>(
-    'tsl',
-  )
+  const [tslOutputKind, setTslOutputKind] = useState<
+    'tsl' | 'material' | 'app' | 'gltf'
+  >('tsl')
+  const [gltfOutputText, setGltfOutputText] = useState('')
   const [viewerReadyTick, setViewerReadyTick] = useState(0)
   const [exportFormat, setExportFormat] = useState<'js' | 'ts'>('js')
   const [toast, setToast] = useState<string | null>(null)
@@ -12496,9 +12500,16 @@ function App() {
           ]
     const body = code
       .split('\n')
-      .map((line) => `  ${line}`)
+      .map((line) => `    ${line}`)
       .join('\n')
-    return [...header, body, `  return { material, uniforms: { time: timeUniform } };`, `};`].join('\n')
+    return [
+      ...header,
+      `  const material = (() => {`,
+      body,
+      `  })();`,
+      `  return { material, uniforms: { time: timeUniform } };`,
+      `};`,
+    ].join('\n')
   }
 
   const buildCreateAppLines = (format: 'js' | 'ts', exportPrefix: string) => {
@@ -12544,7 +12555,9 @@ function App() {
       `        return new BoxGeometry(1, 1, 1);`,
       `    }`,
       `  })();`,
-      `  const { material, uniforms } = makeNodeMaterial({ textures });`,
+      `  const materialResult = makeNodeMaterial({ textures });`,
+      `  const material = materialResult?.material ?? materialResult;`,
+      `  const uniforms = materialResult?.uniforms ?? { time: TSL.uniform(0) };`,
       `  const mesh = new Mesh(geometry, material);`,
       `  scene.add(mesh);`,
       `  const controls = new OrbitControls(camera, renderer.domElement);`,
@@ -12743,10 +12756,85 @@ function App() {
         return materialExport
       case 'app':
         return appExport
+      case 'gltf':
+        return gltfOutputText || 'glTF export is not ready.'
       default:
         return executableTSL
     }
-  }, [tslOutputKind, materialExport, appExport, executableTSL])
+  }, [tslOutputKind, materialExport, appExport, executableTSL, gltfOutputText])
+
+  useEffect(() => {
+    if (tslOutputKind !== 'gltf') return
+    const exporter = new GLTFExporter()
+    const scene = new Scene()
+    const meshes = meshesRef.current
+    if (!meshes.length) {
+      setGltfOutputText('// No mesh to export')
+      return
+    }
+    const rawMaterial = meshes[0]?.material
+    const primaryMaterial = Array.isArray(rawMaterial) ? rawMaterial[0] : rawMaterial
+    const entrypoints = primaryMaterial
+      ? [
+          'colorNode',
+          'roughnessNode',
+          'metalnessNode',
+          'emissiveNode',
+          'opacityNode',
+          'alphaTestNode',
+          'positionNode',
+          'clearcoatNode',
+          'clearcoatRoughnessNode',
+        ].filter((slot) =>
+          Boolean((primaryMaterial as unknown as Record<string, unknown>)[slot]),
+        )
+      : []
+    exporter.register(
+      (writer) =>
+        new THREEMaterialsTSLExporterPlugin(writer, {
+          entrypoints,
+          nodeSerializer: createDefaultNodeSerializer(),
+        }),
+    )
+    meshes.forEach((mesh) => {
+      const clone = mesh.clone()
+      clone.geometry = mesh.geometry
+      clone.material = mesh.material
+      clone.updateMatrix()
+      clone.updateMatrixWorld(true)
+      scene.add(clone)
+    })
+    exporter.parse(
+      scene,
+      (result) => {
+        if (typeof result === 'string') {
+          setGltfOutputText(result)
+          return
+        }
+        const gltf = result as {
+          buffers?: Array<{ uri?: string }>
+        }
+        const next = {
+          ...gltf,
+          buffers: gltf.buffers?.map((buffer) => {
+            if (!buffer?.uri || buffer.uri.length <= 100) return buffer
+            const omitted = buffer.uri.length - 100
+            return {
+              ...buffer,
+              uri: `${buffer.uri.slice(0, 100)}... [${omitted} chars omitted]`,
+            }
+          }),
+        }
+        const data = JSON.stringify(next, null, 2)
+        setGltfOutputText(data)
+      },
+      (error) => {
+        const message = error instanceof Error ? error.message : 'Unknown glTF error'
+        setGltfOutputText(`// glTF export failed: ${message}`)
+      },
+      { binary: false },
+    )
+  }, [tslOutputKind, graphSignature, geometrySignature, textureSignature])
   const viewerTextures = useMemo(() => {
     const expanded = expandFunctions(nodes, connections, functions)
     const payload: Record<string, { src: string; name?: string }> = {}
@@ -12853,6 +12941,78 @@ function App() {
     URL.revokeObjectURL(url)
     setToast('TSL export downloaded')
   }, [exportFormat, tslOutput, tslOutputKind])
+
+  const downloadGltfExport = useCallback(() => {
+    const exporter = new GLTFExporter()
+    const scene = new Scene()
+    const meshes = meshesRef.current
+    if (!meshes.length) {
+      setToast('No mesh to export')
+      return
+    }
+    const rawMaterial = meshes[0]?.material
+    const primaryMaterial = Array.isArray(rawMaterial) ? rawMaterial[0] : rawMaterial
+    const entrypoints = primaryMaterial
+      ? [
+          'colorNode',
+          'roughnessNode',
+          'metalnessNode',
+          'emissiveNode',
+          'opacityNode',
+          'alphaTestNode',
+          'positionNode',
+          'clearcoatNode',
+          'clearcoatRoughnessNode',
+        ].filter((slot) =>
+          Boolean((primaryMaterial as unknown as Record<string, unknown>)[slot]),
+        )
+      : []
+    exporter.register(
+      (writer) =>
+        new THREEMaterialsTSLExporterPlugin(writer, {
+          entrypoints,
+          nodeSerializer: createDefaultNodeSerializer(),
+        }),
+    )
+    meshes.forEach((mesh) => {
+      const clone = mesh.clone()
+      clone.geometry = mesh.geometry
+      clone.material = mesh.material
+      clone.updateMatrix()
+      clone.updateMatrixWorld(true)
+      scene.add(clone)
+    })
+    exporter.parse(
+      scene,
+      (result) => {
+        if (result instanceof ArrayBuffer) {
+          const blob = new Blob([result], { type: 'model/gltf-binary' })
+          const url = URL.createObjectURL(blob)
+          const link = document.createElement('a')
+          link.href = url
+          link.download = 'tsl-node-editor.glb'
+          link.click()
+          URL.revokeObjectURL(url)
+          setToast('glTF export downloaded')
+          return
+        }
+        const data = JSON.stringify(result, null, 2)
+        const blob = new Blob([data], { type: 'model/gltf+json' })
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = 'tsl-node-editor.gltf'
+        link.click()
+        URL.revokeObjectURL(url)
+        setToast('glTF export downloaded')
+      },
+      (error) => {
+        const message = error instanceof Error ? error.message : 'Unknown glTF error'
+        setToast(`glTF export failed: ${message}`)
+      },
+      { binary: true },
+    )
+  }, [])
 
   const blockCanvasPointer = useCallback((event: React.SyntheticEvent) => {
     event.stopPropagation()
@@ -14648,7 +14808,12 @@ function App() {
                       value={tslOutputKind}
                       onChange={(event) => {
                         const value = event.target.value
-                        if (value === 'material' || value === 'app' || value === 'tsl') {
+                        if (
+                          value === 'material' ||
+                          value === 'app' ||
+                          value === 'tsl' ||
+                          value === 'gltf'
+                        ) {
                           setTslOutputKind(value)
                         }
                       }}
@@ -14656,41 +14821,54 @@ function App() {
                       <option value="tsl">TSL</option>
                       <option value="material">Material</option>
                       <option value="app">App</option>
+                      <option value="gltf">glTF</option>
                     </select>
                   </label>
                 </div>
                 <div className="code-overlay-actions">
                   {tslPanelMode === 'code' ? (
                     <div className="tsl-export-controls">
-                      <label className="export-format">
-                        <span>Format</span>
-                        <select
-                          className="palette-select"
-                          value={exportFormat}
-                          onChange={(event) =>
-                            setExportFormat(
-                              event.target.value === 'ts' ? 'ts' : 'js',
-                            )
-                          }
+                      {tslOutputKind === 'gltf' ? (
+                        <button
+                          className="palette-button"
+                          type="button"
+                          onClick={downloadGltfExport}
                         >
-                          <option value="js">JS</option>
-                          <option value="ts">TS</option>
-                        </select>
-                      </label>
-                      <button
-                        className="palette-button"
-                        type="button"
-                        onClick={copyTSLExport}
-                      >
-                        Copy TSL Output
-                      </button>
-                      <button
-                        className="palette-button"
-                        type="button"
-                        onClick={downloadTSLExport}
-                      >
-                        Download TSL Output
-                      </button>
+                          Download glTF
+                        </button>
+                      ) : (
+                        <>
+                          <label className="export-format">
+                            <span>Format</span>
+                            <select
+                              className="palette-select"
+                              value={exportFormat}
+                              onChange={(event) =>
+                                setExportFormat(
+                                  event.target.value === 'ts' ? 'ts' : 'js',
+                                )
+                              }
+                            >
+                              <option value="js">JS</option>
+                              <option value="ts">TS</option>
+                            </select>
+                          </label>
+                          <button
+                            className="palette-button"
+                            type="button"
+                            onClick={copyTSLExport}
+                          >
+                            Copy TSL Output
+                          </button>
+                          <button
+                            className="palette-button"
+                            type="button"
+                            onClick={downloadTSLExport}
+                          >
+                            Download TSL Output
+                          </button>
+                        </>
+                      )}
                     </div>
                   ) : null}
                   <div className="code-overlay-tabs">
@@ -14724,7 +14902,7 @@ function App() {
                   <iframe
                     ref={viewerRef}
                     className="viewer-frame"
-                    src="/viewer.html"
+                    src={`${import.meta.env.BASE_URL}viewer.html`}
                     title="TSL Viewer"
                   />
                 </div>
