@@ -240,7 +240,27 @@ type PaletteItem = {
   outputs: string[]
   defaultValue?: string
 }
+type ExampleGraph = {
+  nodes: GraphNode[]
+  connections: GraphConnection[]
+  groups?: GraphGroup[]
+  functions?: Record<string, FunctionDefinition>
+  ui?: { paletteOpen?: Record<string, boolean> }
+}
+type GltfTextureInfo = {
+  texture?: Texture | null
+  scale?: Vector2
+  strength?: number
+}
+type GltfPbrMetallicRoughness = {
+  baseColorFactor?: number[]
+  baseColorTexture?: GltfTextureInfo
+  metallicFactor?: number
+  roughnessFactor?: number
+  metallicRoughnessTexture?: GltfTextureInfo
+}
 type GltfMaterial = Material & {
+  [key: string]: unknown
   color?: Color
   map?: Texture | null
   roughness?: number
@@ -260,6 +280,37 @@ type GltfMaterial = Material & {
   alphaTest?: number
   alphaHash?: boolean
   name?: string
+  pbrMetallicRoughness?: GltfPbrMetallicRoughness
+  emissiveFactor?: number[]
+  emissiveTexture?: GltfTextureInfo
+  emissiveStrength?: number
+  normalTexture?: GltfTextureInfo
+  occlusionTexture?: GltfTextureInfo
+  clearcoatFactor?: number
+  clearcoatTexture?: GltfTextureInfo
+  clearcoatRoughnessFactor?: number
+  clearcoatRoughnessTexture?: GltfTextureInfo
+  clearcoatNormalTexture?: GltfTextureInfo
+  sheenColorFactor?: number[]
+  sheenColorTexture?: GltfTextureInfo
+  sheenRoughnessFactor?: number
+  sheenRoughnessTexture?: GltfTextureInfo
+  iridescenceFactor?: number
+  iridescenceTexture?: GltfTextureInfo
+  iridescenceIOR?: number
+  iridescenceThicknessRange?: [number, number]
+  iridescenceThicknessTexture?: GltfTextureInfo
+  ior?: number
+  transmissionFactor?: number
+  transmissionTexture?: GltfTextureInfo
+  thicknessFactor?: number
+  thicknessTexture?: GltfTextureInfo
+  attenuationColor?: number[]
+  attenuationDistance?: number
+  specularColorFactor?: number[]
+  specularColorTexture?: GltfTextureInfo
+  specularFactor?: number
+  specularTexture?: GltfTextureInfo
 }
 
 type GltfAssetEntry = {
@@ -279,6 +330,25 @@ const buildConnectionMap = (connections: GraphConnection[]): ConnectionMap =>
       connection,
     ]),
   )
+
+const sanitizeConnections = (
+  connections: GraphConnection[],
+  nodes: GraphNode[],
+): GraphConnection[] => {
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  const seenTargets = new Set<string>()
+  const next: GraphConnection[] = []
+  connections.forEach((connection) => {
+    if (!nodeIds.has(connection.from.nodeId) || !nodeIds.has(connection.to.nodeId)) {
+      return
+    }
+    const key = `${connection.to.nodeId}:${connection.to.pin}`
+    if (seenTargets.has(key)) return
+    seenTargets.add(key)
+    next.push(connection)
+  })
+  return next
+}
 
 const expandFunctions = (
   nodes: GraphNode[],
@@ -486,6 +556,12 @@ function App() {
     groups: GraphGroup[]
     functions: Record<string, FunctionDefinition>
   }
+  type HistoryState = {
+    past: HistorySnapshot[]
+    future: HistorySnapshot[]
+    last: HistorySnapshot | null
+    lastSig: string | null
+  }
   const historyRef = useRef<{
     past: HistorySnapshot[]
     future: HistorySnapshot[]
@@ -550,8 +626,19 @@ function App() {
     {},
   )
   const objectUrlRef = useRef<Record<string, string>>({})
-  const storageKey = 'default'
+  const [storageSlot, setStorageSlot] = useState('default')
+  const [storageSlots, setStorageSlots] = useState<string[]>(['default'])
+  const [newSlotName, setNewSlotName] = useState('')
+  const historyBySlotRef = useRef<Record<string, HistoryState>>({})
+  const historySlotRef = useRef(storageSlot)
+
+  const lastSlotStorageKey = 'tsl-node-editor:last-slot'
+  const autoSaveTimerRef = useRef<number | null>(null)
+  const isHydratingRef = useRef(false)
+  const pendingExampleLayoutRef = useRef(false)
+  const nodeSizeRef = useRef<Record<string, { width: number; height: number }>>({})
   const dbName = 'tsl-node-editor'
+  const graphSchemaVersion = 2
   const dbVersion = 2
 
   const basePalette = useMemo<PaletteItem[]>(
@@ -1734,81 +1821,156 @@ function App() {
     }
   }, [activeFunctionId, functions])
 
+  const estimateNodeHeight = useCallback((node: GraphNode) => {
+    const measured = nodeSizeRef.current[node.id]?.height
+    if (measured) return measured
+    const pinCount = Math.max(node.inputs.length, node.outputs.length)
+    const headerHeight = 40
+    const rowHeight = 26
+    const padding = 32
+    return headerHeight + padding + pinCount * rowHeight
+  }, [])
+
+  const cloneHistoryState = (state: HistoryState): HistoryState => ({
+    past: state.past.map((snap) => ({
+      nodes: [...snap.nodes],
+      connections: [...snap.connections],
+      groups: [...snap.groups],
+      functions: { ...snap.functions },
+    })),
+    future: state.future.map((snap) => ({
+      nodes: [...snap.nodes],
+      connections: [...snap.connections],
+      groups: [...snap.groups],
+      functions: { ...snap.functions },
+    })),
+    last: state.last
+      ? {
+          nodes: [...state.last.nodes],
+          connections: [...state.last.connections],
+          groups: [...state.last.groups],
+          functions: { ...state.last.functions },
+        }
+      : null,
+    lastSig: state.lastSig,
+  })
+
+  const spreadNodesByColumn = useCallback(
+    (graphNodes: GraphNode[]) => {
+      const updates = new Map<string, GraphNode>()
+      const columns: Array<{ x: number; nodes: GraphNode[] }> = []
+      const columnThreshold = 40
+      graphNodes.forEach((node) => {
+        let column = columns.find((entry) => Math.abs(entry.x - node.x) <= columnThreshold)
+        if (!column) {
+          column = { x: node.x, nodes: [] }
+          columns.push(column)
+        }
+        column.nodes.push(node)
+      })
+      columns.sort((a, b) => a.x - b.x)
+      columns.forEach((column) => {
+        const list = column.nodes
+        list.sort((a, b) => a.y - b.y)
+        let cursor = -Infinity
+        const spacing = 40
+        list.forEach((node, index) => {
+          const height = Math.max(estimateNodeHeight(node), 120)
+          const nextY = index === 0 ? node.y : Math.max(node.y, cursor + spacing)
+          cursor = nextY + height
+          updates.set(node.id, { ...node, y: nextY })
+        })
+      })
+      return graphNodes.map((node) => updates.get(node.id) ?? node)
+    },
+    [estimateNodeHeight],
+  )
+
+  const computeLayout = useCallback(
+    (graphNodes: GraphNode[], graphConnections: GraphConnection[]) => {
+      if (!graphNodes.length) return graphNodes
+      const nodeMap = buildNodeMap(graphNodes)
+      const incoming = new Map<string, Set<string>>()
+      const outgoing = new Map<string, Set<string>>()
+      graphNodes.forEach((node) => {
+        incoming.set(node.id, new Set())
+        outgoing.set(node.id, new Set())
+      })
+      graphConnections.forEach((connection) => {
+        if (!nodeMap.has(connection.from.nodeId) || !nodeMap.has(connection.to.nodeId)) {
+          return
+        }
+        outgoing.get(connection.from.nodeId)?.add(connection.to.nodeId)
+        incoming.get(connection.to.nodeId)?.add(connection.from.nodeId)
+      })
+      const queue: string[] = []
+      incoming.forEach((sources, id) => {
+        if (sources.size === 0) queue.push(id)
+      })
+      const order: string[] = []
+      const tempIncoming = new Map(
+        Array.from(incoming.entries()).map(([id, sources]) => [id, new Set(sources)]),
+      )
+      while (queue.length) {
+        const id = queue.shift()!
+        order.push(id)
+        outgoing.get(id)?.forEach((next) => {
+          const set = tempIncoming.get(next)
+          if (!set) return
+          set.delete(id)
+          if (set.size === 0) {
+            queue.push(next)
+          }
+        })
+      }
+      graphNodes.forEach((node) => {
+        if (!order.includes(node.id)) {
+          order.push(node.id)
+        }
+      })
+      const depth = new Map<string, number>()
+      order.forEach((id) => {
+        const parents = incoming.get(id)
+        if (!parents || parents.size === 0) {
+          depth.set(id, 0)
+          return
+        }
+        let maxDepth = 0
+        parents.forEach((parent) => {
+          const parentDepth = depth.get(parent)
+          if (parentDepth !== undefined) {
+            maxDepth = Math.max(maxDepth, parentDepth + 1)
+          }
+        })
+        depth.set(id, maxDepth)
+      })
+      const columns = new Map<number, string[]>()
+      order.forEach((id) => {
+        const column = depth.get(id) ?? 0
+        if (!columns.has(column)) columns.set(column, [])
+        columns.get(column)?.push(id)
+      })
+      const xSpacing = 280
+      const ySpacing = 170
+      return graphNodes.map((node) => {
+        const column = depth.get(node.id) ?? 0
+        const list = columns.get(column) ?? []
+        const rowIndex = list.indexOf(node.id)
+        return {
+          ...node,
+          x: 40 + column * xSpacing,
+          y: 40 + rowIndex * ySpacing,
+        }
+      })
+    },
+    [],
+  )
+
   const layoutNodes = useCallback(() => {
     if (!editorNodes.length) return
-    const nodeMap = buildNodeMap(editorNodes)
-    const incoming = new Map<string, Set<string>>()
-    const outgoing = new Map<string, Set<string>>()
-    editorNodes.forEach((node) => {
-      incoming.set(node.id, new Set())
-      outgoing.set(node.id, new Set())
-    })
-    editorConnections.forEach((connection) => {
-      if (!nodeMap.has(connection.from.nodeId) || !nodeMap.has(connection.to.nodeId)) return
-      outgoing.get(connection.from.nodeId)?.add(connection.to.nodeId)
-      incoming.get(connection.to.nodeId)?.add(connection.from.nodeId)
-    })
-    const queue: string[] = []
-    incoming.forEach((sources, id) => {
-      if (sources.size === 0) queue.push(id)
-    })
-    const order: string[] = []
-    const tempIncoming = new Map(
-      Array.from(incoming.entries()).map(([id, sources]) => [id, new Set(sources)]),
-    )
-    while (queue.length) {
-      const id = queue.shift()!
-      order.push(id)
-      outgoing.get(id)?.forEach((next) => {
-        const set = tempIncoming.get(next)
-        if (!set) return
-        set.delete(id)
-        if (set.size === 0) {
-          queue.push(next)
-        }
-      })
-    }
-    editorNodes.forEach((node) => {
-      if (!order.includes(node.id)) {
-        order.push(node.id)
-      }
-    })
-    const depth = new Map<string, number>()
-    order.forEach((id) => {
-      const parents = incoming.get(id)
-      if (!parents || parents.size === 0) {
-        depth.set(id, 0)
-        return
-      }
-      let maxDepth = 0
-      parents.forEach((parent) => {
-        const parentDepth = depth.get(parent)
-        if (parentDepth !== undefined) {
-          maxDepth = Math.max(maxDepth, parentDepth + 1)
-        }
-      })
-      depth.set(id, maxDepth)
-    })
-    const columns = new Map<number, string[]>()
-    order.forEach((id) => {
-      const column = depth.get(id) ?? 0
-      if (!columns.has(column)) columns.set(column, [])
-      columns.get(column)?.push(id)
-    })
-    const xSpacing = 280
-    const ySpacing = 170
-    const nextNodes = editorNodes.map((node) => {
-      const column = depth.get(node.id) ?? 0
-      const list = columns.get(column) ?? []
-      const rowIndex = list.indexOf(node.id)
-      return {
-        ...node,
-        x: 40 + column * xSpacing,
-        y: 40 + rowIndex * ySpacing,
-      }
-    })
-    setEditorNodes(nextNodes)
-  }, [editorConnections, editorNodes, setEditorNodes])
+    const next = computeLayout(editorNodes, editorConnections)
+    setEditorNodes(spreadNodesByColumn(next))
+  }, [computeLayout, editorConnections, editorNodes, setEditorNodes, spreadNodesByColumn])
 
   const paletteDefaults = useMemo(
     () =>
@@ -1829,6 +1991,735 @@ function App() {
   useEffect(() => {
     setPaletteOpen((prev) => ({ ...paletteDefaults, ...prev }))
   }, [paletteDefaults])
+
+  const exampleGraph = useMemo<ExampleGraph>(
+    () => ({
+      nodes: [
+        {
+          id: 'color-example',
+          type: 'color',
+          label: 'Color',
+          x: 60,
+          y: 120,
+          inputs: [],
+          outputs: ['color'],
+          value: DEFAULT_COLOR,
+        },
+        {
+          id: 'geometry-example',
+          type: 'geometryPrimitive',
+          label: 'Geometry',
+          x: 60,
+          y: 400,
+          inputs: [],
+          outputs: ['geometry'],
+          value: 'torus',
+        },
+        {
+          id: 'geometry-output-example',
+          type: 'geometryOutput',
+          label: 'Geometry Output',
+          x: 320,
+          y: 460,
+          inputs: ['geometry'],
+          outputs: [],
+        },
+        {
+          id: 'time-example',
+          type: 'time',
+          label: 'Time',
+          x: 60,
+          y: 260,
+          inputs: [],
+          outputs: ['value'],
+        },
+        {
+          id: 'color-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 1100,
+          y: 200,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'position-example',
+          type: 'position',
+          label: 'Position',
+          x: 60,
+          y: 540,
+          inputs: [],
+          outputs: ['value'],
+        },
+        {
+          id: 'length-example',
+          type: 'length',
+          label: 'Length',
+          x: 320,
+          y: 1000,
+          inputs: ['value'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-freq-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 1180,
+          inputs: [],
+          outputs: ['value'],
+          value: '6',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'pos-freq-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 580,
+          y: 940,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-speed-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 640,
+          inputs: [],
+          outputs: ['value'],
+          value: '2.5',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'pos-time-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 580,
+          y: 520,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-time-neg-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 820,
+          inputs: [],
+          outputs: ['value'],
+          value: '-1',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'pos-time-neg-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 580,
+          y: 660,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-phase-example',
+          type: 'add',
+          label: 'Add',
+          x: 840,
+          y: 420,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-wave-example',
+          type: 'sine',
+          label: 'Sine',
+          x: 1100,
+          y: 420,
+          inputs: ['value'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-edge-low-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 120,
+          inputs: [],
+          outputs: ['value'],
+          value: '0.85',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'pos-edge-high-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 280,
+          inputs: [],
+          outputs: ['value'],
+          value: '0.95',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'pos-band-example',
+          type: 'smoothstep',
+          label: 'Smoothstep',
+          x: 1360,
+          y: 420,
+          inputs: ['edge0', 'edge1', 'x'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-invert-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 1620,
+          y: 420,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-invert-bias-example',
+          type: 'number',
+          label: 'Number',
+          x: 1620,
+          y: 560,
+          inputs: [],
+          outputs: ['value'],
+          value: '-1',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'pos-invert-add-example',
+          type: 'add',
+          label: 'Add',
+          x: 1880,
+          y: 420,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'pos-invert-one-example',
+          type: 'number',
+          label: 'Number',
+          x: 1880,
+          y: 560,
+          inputs: [],
+          outputs: ['value'],
+          value: '1',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'normal-example',
+          type: 'normal',
+          label: 'Normal',
+          x: 60,
+          y: 700,
+          inputs: [],
+          outputs: ['value'],
+        },
+        {
+          id: 'vert-split-example',
+          type: 'splitVec3',
+          label: 'Split Vec3',
+          x: 320,
+          y: 1360,
+          inputs: ['value'],
+          outputs: ['x', 'y', 'z'],
+        },
+        {
+          id: 'vert-length-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 580,
+          y: 1080,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'vert-freq-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 1540,
+          inputs: [],
+          outputs: ['value'],
+          value: '3',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'vert-time-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 580,
+          y: 1360,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'vert-speed-example',
+          type: 'number',
+          label: 'Number',
+          x: 320,
+          y: 1720,
+          inputs: [],
+          outputs: ['value'],
+          value: '2',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'vert-phase-example',
+          type: 'add',
+          label: 'Add',
+          x: 840,
+          y: 1220,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'vert-sine-example',
+          type: 'sine',
+          label: 'Sine',
+          x: 1100,
+          y: 1220,
+          inputs: ['value'],
+          outputs: ['value'],
+        },
+        {
+          id: 'vert-amp-example',
+          type: 'number',
+          label: 'Number',
+          x: 1100,
+          y: 1360,
+          inputs: [],
+          outputs: ['value'],
+          value: '0.15',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'vert-amp-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 1360,
+          y: 1220,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'vert-normal-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 1360,
+          y: 1360,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'vertex-output-example',
+          type: 'vertexOutput',
+          label: 'Vertex Output',
+          x: 1620,
+          y: 1280,
+          inputs: ['position'],
+          outputs: [],
+        },
+        {
+          id: 'final-mult-example',
+          type: 'multiply',
+          label: 'Multiply',
+          x: 2140,
+          y: 260,
+          inputs: ['a', 'b'],
+          outputs: ['value'],
+        },
+        {
+          id: 'roughness-example',
+          type: 'number',
+          label: 'Number',
+          x: 60,
+          y: 840,
+          inputs: [],
+          outputs: ['value'],
+          value: '0.6',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'metalness-example',
+          type: 'number',
+          label: 'Number',
+          x: 60,
+          y: 980,
+          inputs: [],
+          outputs: ['value'],
+          value: '0.1',
+          slider: false,
+          updateMode: 'manual',
+          updateSource: 'value',
+        },
+        {
+          id: 'output-example',
+          type: 'output',
+          label: 'Fragment Output',
+          x: 2400,
+          y: 260,
+          inputs: ['baseColor', 'roughness', 'metalness'],
+          outputs: [],
+        },
+      ],
+      connections: [
+        {
+          id: 'conn-time-speed',
+          from: { nodeId: 'time-example', pin: 'value' },
+          to: { nodeId: 'pos-time-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-color-mult',
+          from: { nodeId: 'color-example', pin: 'color' },
+          to: { nodeId: 'color-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-geometry-output',
+          from: { nodeId: 'geometry-example', pin: 'geometry' },
+          to: { nodeId: 'geometry-output-example', pin: 'geometry' },
+        },
+        {
+          id: 'conn-position-add',
+          from: { nodeId: 'position-example', pin: 'value' },
+          to: { nodeId: 'length-example', pin: 'value' },
+        },
+        {
+          id: 'conn-length-freq',
+          from: { nodeId: 'length-example', pin: 'value' },
+          to: { nodeId: 'pos-freq-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-freq-mult',
+          from: { nodeId: 'pos-freq-example', pin: 'value' },
+          to: { nodeId: 'pos-freq-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-speed-mult',
+          from: { nodeId: 'pos-speed-example', pin: 'value' },
+          to: { nodeId: 'pos-time-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-time-neg',
+          from: { nodeId: 'pos-time-mult-example', pin: 'value' },
+          to: { nodeId: 'pos-time-neg-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-time-neg-value',
+          from: { nodeId: 'pos-time-neg-example', pin: 'value' },
+          to: { nodeId: 'pos-time-neg-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-phase-add-a',
+          from: { nodeId: 'pos-freq-mult-example', pin: 'value' },
+          to: { nodeId: 'pos-phase-example', pin: 'a' },
+        },
+        {
+          id: 'conn-phase-add-b',
+          from: { nodeId: 'pos-time-neg-mult-example', pin: 'value' },
+          to: { nodeId: 'pos-phase-example', pin: 'b' },
+        },
+        {
+          id: 'conn-phase-sine',
+          from: { nodeId: 'pos-phase-example', pin: 'value' },
+          to: { nodeId: 'pos-wave-example', pin: 'value' },
+        },
+        {
+          id: 'conn-band-edge0',
+          from: { nodeId: 'pos-edge-low-example', pin: 'value' },
+          to: { nodeId: 'pos-band-example', pin: 'edge0' },
+        },
+        {
+          id: 'conn-band-edge1',
+          from: { nodeId: 'pos-edge-high-example', pin: 'value' },
+          to: { nodeId: 'pos-band-example', pin: 'edge1' },
+        },
+        {
+          id: 'conn-band-x',
+          from: { nodeId: 'pos-wave-example', pin: 'value' },
+          to: { nodeId: 'pos-band-example', pin: 'x' },
+        },
+        {
+          id: 'conn-invert-band',
+          from: { nodeId: 'pos-band-example', pin: 'value' },
+          to: { nodeId: 'pos-invert-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-invert-mult',
+          from: { nodeId: 'pos-invert-bias-example', pin: 'value' },
+          to: { nodeId: 'pos-invert-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-invert-add-a',
+          from: { nodeId: 'pos-invert-mult-example', pin: 'value' },
+          to: { nodeId: 'pos-invert-add-example', pin: 'a' },
+        },
+        {
+          id: 'conn-invert-add-b',
+          from: { nodeId: 'pos-invert-one-example', pin: 'value' },
+          to: { nodeId: 'pos-invert-add-example', pin: 'b' },
+        },
+        {
+          id: 'conn-vert-length',
+          from: { nodeId: 'vert-split-example', pin: 'y' },
+          to: { nodeId: 'vert-length-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-vert-split',
+          from: { nodeId: 'position-example', pin: 'value' },
+          to: { nodeId: 'vert-split-example', pin: 'value' },
+        },
+        {
+          id: 'conn-vert-freq',
+          from: { nodeId: 'vert-freq-example', pin: 'value' },
+          to: { nodeId: 'vert-length-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-vert-time',
+          from: { nodeId: 'time-example', pin: 'value' },
+          to: { nodeId: 'vert-time-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-vert-speed',
+          from: { nodeId: 'vert-speed-example', pin: 'value' },
+          to: { nodeId: 'vert-time-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-vert-phase-a',
+          from: { nodeId: 'vert-length-mult-example', pin: 'value' },
+          to: { nodeId: 'vert-phase-example', pin: 'a' },
+        },
+        {
+          id: 'conn-vert-phase-b',
+          from: { nodeId: 'vert-time-mult-example', pin: 'value' },
+          to: { nodeId: 'vert-phase-example', pin: 'b' },
+        },
+        {
+          id: 'conn-vert-sine',
+          from: { nodeId: 'vert-phase-example', pin: 'value' },
+          to: { nodeId: 'vert-sine-example', pin: 'value' },
+        },
+        {
+          id: 'conn-vert-amp-sine',
+          from: { nodeId: 'vert-sine-example', pin: 'value' },
+          to: { nodeId: 'vert-amp-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-vert-amp',
+          from: { nodeId: 'vert-amp-example', pin: 'value' },
+          to: { nodeId: 'vert-amp-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-vert-normal',
+          from: { nodeId: 'normal-example', pin: 'value' },
+          to: { nodeId: 'vert-normal-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-vert-offset',
+          from: { nodeId: 'vert-amp-mult-example', pin: 'value' },
+          to: { nodeId: 'vert-normal-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-vert-output',
+          from: { nodeId: 'vert-normal-mult-example', pin: 'value' },
+          to: { nodeId: 'vertex-output-example', pin: 'position' },
+        },
+        {
+          id: 'conn-color-final',
+          from: { nodeId: 'color-mult-example', pin: 'value' },
+          to: { nodeId: 'final-mult-example', pin: 'a' },
+        },
+        {
+          id: 'conn-pos-final',
+          from: { nodeId: 'pos-invert-add-example', pin: 'value' },
+          to: { nodeId: 'final-mult-example', pin: 'b' },
+        },
+        {
+          id: 'conn-color-output',
+          from: { nodeId: 'final-mult-example', pin: 'value' },
+          to: { nodeId: 'output-example', pin: 'baseColor' },
+        },
+        {
+          id: 'conn-roughness-output',
+          from: { nodeId: 'roughness-example', pin: 'value' },
+          to: { nodeId: 'output-example', pin: 'roughness' },
+        },
+        {
+          id: 'conn-metalness-output',
+          from: { nodeId: 'metalness-example', pin: 'value' },
+          to: { nodeId: 'output-example', pin: 'metalness' },
+        },
+      ],
+      groups: [],
+      functions: {},
+      ui: { paletteOpen: paletteDefaults },
+    }),
+    [paletteDefaults],
+  )
+
+  const migrateGraph = (
+    currentNodes: GraphNode[],
+    currentConnections: GraphConnection[],
+    version: number,
+  ): { nodes: GraphNode[]; connections: GraphConnection[]; version: number } => {
+    let nextNodes = currentNodes
+    let nextConnections = currentConnections
+    let nextVersion = version
+
+    if (nextVersion < 2) {
+      const nodeMap = buildNodeMap(nextNodes)
+      const byTo = buildConnectionMap(nextConnections)
+      const byFrom = new Map<string, GraphConnection[]>()
+      nextConnections.forEach((connection) => {
+        const list = byFrom.get(connection.from.nodeId)
+        if (list) {
+          list.push(connection)
+        } else {
+          byFrom.set(connection.from.nodeId, [connection])
+        }
+      })
+      const newConnections = [...nextConnections]
+
+      const ensureConnection = (
+        id: string,
+        from: { nodeId: string; pin: string },
+        to: { nodeId: string; pin: string },
+      ) => {
+        const targetKey = `${to.nodeId}:${to.pin}`
+        if (byTo.has(targetKey)) return
+        const connection = { id, from, to }
+        newConnections.push(connection)
+        byTo.set(targetKey, connection)
+        const list = byFrom.get(from.nodeId)
+        if (list) {
+          list.push(connection)
+        } else {
+          byFrom.set(from.nodeId, [connection])
+        }
+      }
+
+      const positionNode = nodeMap.get('position-example') ?? nextNodes.find((n) => n.type === 'position')
+      const lengthNode = nodeMap.get('length-example') ?? nextNodes.find((n) => n.type === 'length')
+      const freqNumber =
+        nodeMap.get('pos-freq-example') ??
+        nextNodes.find((n) => n.type === 'number' && Math.abs(parseNumber(n.value) - 6) < 1e-4)
+
+      const findSmoothstepChain = () => {
+        const smoothstep = nextNodes.find((node) => node.type === 'smoothstep')
+        if (!smoothstep) return null
+        const xConn = byTo.get(`${smoothstep.id}:x`)
+        const sine = xConn ? nodeMap.get(xConn.from.nodeId) : null
+        if (!sine || sine.type !== 'sine') return null
+        const addConn = byTo.get(`${sine.id}:value`)
+        const add = addConn ? nodeMap.get(addConn.from.nodeId) : null
+        if (!add || add.type !== 'add') return null
+        return { smoothstep, sine, add }
+      }
+
+      const chain = findSmoothstepChain()
+      const addNode = chain?.add ?? null
+      const isFreqMultiply = (node: GraphNode) => {
+        if (node.type !== 'multiply' || !freqNumber) return false
+        const connA = byTo.get(`${node.id}:a`)
+        const connB = byTo.get(`${node.id}:b`)
+        return (
+          connA?.from.nodeId === freqNumber.id || connB?.from.nodeId === freqNumber.id
+        )
+      }
+
+      let freqMultiply: GraphNode | null = null
+      if (addNode) {
+        const connA = byTo.get(`${addNode.id}:a`)
+        const connB = byTo.get(`${addNode.id}:b`)
+        const nodeA = connA ? nodeMap.get(connA.from.nodeId) : null
+        const nodeB = connB ? nodeMap.get(connB.from.nodeId) : null
+        if (nodeA && isFreqMultiply(nodeA)) freqMultiply = nodeA
+        if (!freqMultiply && nodeB && isFreqMultiply(nodeB)) freqMultiply = nodeB
+      }
+      if (!freqMultiply) {
+        freqMultiply = nextNodes.find((node) => isFreqMultiply(node)) ?? null
+      }
+
+      if (positionNode && lengthNode) {
+        ensureConnection(
+          'migrate-pos-length',
+          { nodeId: positionNode.id, pin: 'value' },
+          { nodeId: lengthNode.id, pin: 'value' },
+        )
+      }
+      if (lengthNode && freqMultiply && freqNumber) {
+        const connA = byTo.get(`${freqMultiply.id}:a`)
+        const connB = byTo.get(`${freqMultiply.id}:b`)
+        const hasLength =
+          connA?.from.nodeId === lengthNode.id || connB?.from.nodeId === lengthNode.id
+        const hasFreq =
+          connA?.from.nodeId === freqNumber.id || connB?.from.nodeId === freqNumber.id
+        if (!hasLength) {
+          if (!connA) {
+            ensureConnection(
+              'migrate-length-freq-a',
+              { nodeId: lengthNode.id, pin: 'value' },
+              { nodeId: freqMultiply.id, pin: 'a' },
+            )
+          } else if (!connB) {
+            ensureConnection(
+              'migrate-length-freq-b',
+              { nodeId: lengthNode.id, pin: 'value' },
+              { nodeId: freqMultiply.id, pin: 'b' },
+            )
+          }
+        }
+        if (!hasFreq) {
+          const connA2 = byTo.get(`${freqMultiply.id}:a`)
+          const connB2 = byTo.get(`${freqMultiply.id}:b`)
+          if (!connA2) {
+            ensureConnection(
+              'migrate-freq-a',
+              { nodeId: freqNumber.id, pin: 'value' },
+              { nodeId: freqMultiply.id, pin: 'a' },
+            )
+          } else if (!connB2) {
+            ensureConnection(
+              'migrate-freq-b',
+              { nodeId: freqNumber.id, pin: 'value' },
+              { nodeId: freqMultiply.id, pin: 'b' },
+            )
+          }
+        }
+      }
+
+      nextConnections = newConnections
+
+      nextVersion = 2
+    }
+
+    return { nodes: nextNodes, connections: nextConnections, version: nextVersion }
+  }
 
   const inputTypes = useMemo<Record<string, Record<string, string>>>(
     () => ({
@@ -2633,7 +3524,118 @@ function App() {
       request.onerror = () => reject(request.error)
     })
 
-  const saveGraph = async () => {
+  const normalizeSlot = (value: string) => value.trim() || 'default'
+
+  const buildSlotKey = (slot: string, id: string) => `${slot}:${id}`
+
+  const clearSlotEntries = (store: IDBObjectStore, slot: string) =>
+    new Promise<void>((resolve, reject) => {
+      const prefix = `${slot}:`
+      const cursorReq = store.openCursor()
+      cursorReq.onerror = () => reject(cursorReq.error)
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result
+        if (!cursor) {
+          resolve()
+          return
+        }
+        if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) {
+          cursor.delete()
+        }
+        cursor.continue()
+      }
+    })
+
+  const getSlotRecord = <T,>(
+    store: IDBObjectStore,
+    slot: string,
+    id: string,
+  ): Promise<T | null> =>
+    new Promise((resolve, reject) => {
+      const slotKey = buildSlotKey(slot, id)
+      const getReq = store.get(slotKey)
+      getReq.onsuccess = () => {
+        if (getReq.result) {
+          resolve(getReq.result as T)
+          return
+        }
+        const fallbackReq = store.get(id)
+        fallbackReq.onsuccess = () => resolve((fallbackReq.result as T) ?? null)
+        fallbackReq.onerror = () => reject(fallbackReq.error)
+      }
+      getReq.onerror = () => reject(getReq.error)
+    })
+
+  const refreshStorageSlots = useCallback(async () => {
+    try {
+      const db = await openDB()
+      const tx = db.transaction(['graphs'], 'readonly')
+      const graphs = tx.objectStore('graphs')
+      const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+        const req = graphs.getAllKeys()
+        req.onsuccess = () => resolve(req.result ?? [])
+        req.onerror = () => reject(req.error)
+      })
+      const slots = Array.from(
+        new Set(
+          keys
+            .map((key) => (typeof key === 'string' ? key : ''))
+            .filter(Boolean),
+        ),
+      ).sort((a, b) => a.localeCompare(b))
+      if (!slots.includes('default')) slots.unshift('default')
+      if (storageSlot && !slots.includes(storageSlot)) slots.unshift(storageSlot)
+      setStorageSlots(slots)
+    } catch {
+      setStorageSlots((prev) =>
+        prev.includes('default') ? prev : ['default', ...prev],
+      )
+    }
+  }, [storageSlot])
+
+  useEffect(() => {
+    void refreshStorageSlots()
+  }, [refreshStorageSlots])
+
+  const writeGraphRecord = async (
+    slotKey: string,
+    record: {
+      nodes: typeof nodes
+      connections: typeof connections
+      groups: GraphGroup[]
+      functions: Record<string, FunctionDefinition>
+      ui?: { paletteOpen?: Record<string, boolean> }
+    },
+    options?: { silent?: boolean },
+  ) => {
+    try {
+      const db = await openDB()
+      const tx = db.transaction(['graphs'], 'readwrite')
+      const graphs = tx.objectStore('graphs')
+      await new Promise((resolve, reject) => {
+        const putReq = graphs.put({ id: slotKey, ...record, version: graphSchemaVersion })
+        putReq.onsuccess = () => resolve(null)
+        putReq.onerror = () => reject(putReq.error)
+      })
+      await new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve(null)
+        tx.onerror = () => reject(tx.error)
+      })
+      if (!options?.silent) {
+        setToast(`Saved slot "${slotKey}"`)
+      }
+      void refreshStorageSlots()
+    } catch {
+      if (!options?.silent) {
+        setToast('Save failed')
+      }
+    }
+  }
+
+  const saveGraphWithSlot = async (
+    slotKey: string,
+    options?: { silent?: boolean },
+  ) => {
     try {
       const texturePayloads: Array<{ id: string; blob: Blob; name: string }> = []
       const assetPayloads: Array<{ id: string; blob: Blob; name: string }> = []
@@ -2655,8 +3657,8 @@ function App() {
       }
 
       const payload = {
-        id: storageKey,
-        version: 1,
+        id: slotKey,
+        version: graphSchemaVersion,
         nodes: nodes.map((node) => {
           if (node.type === 'texture') {
             return {
@@ -2688,27 +3690,25 @@ function App() {
       const textures = tx.objectStore('textures')
       const assets = tx.objectStore('assets')
 
-      await new Promise((resolve, reject) => {
-        const clearReq = textures.clear()
-        clearReq.onsuccess = () => resolve(null)
-        clearReq.onerror = () => reject(clearReq.error)
-      })
-      await new Promise((resolve, reject) => {
-        const clearReq = assets.clear()
-        clearReq.onsuccess = () => resolve(null)
-        clearReq.onerror = () => reject(clearReq.error)
-      })
+      await clearSlotEntries(textures, slotKey)
+      await clearSlotEntries(assets, slotKey)
 
       for (const entry of texturePayloads) {
         await new Promise((resolve, reject) => {
-          const putReq = textures.put(entry)
+          const putReq = textures.put({
+            ...entry,
+            id: buildSlotKey(slotKey, entry.id),
+          })
           putReq.onsuccess = () => resolve(null)
           putReq.onerror = () => reject(putReq.error)
         })
       }
       for (const entry of assetPayloads) {
         await new Promise((resolve, reject) => {
-          const putReq = assets.put(entry)
+          const putReq = assets.put({
+            ...entry,
+            id: buildSlotKey(slotKey, entry.id),
+          })
           putReq.onsuccess = () => resolve(null)
           putReq.onerror = () => reject(putReq.error)
         })
@@ -2725,14 +3725,58 @@ function App() {
         tx.onerror = () => reject(tx.error)
       })
 
-      setToast('Saved to IndexedDB')
+      if (!options?.silent) {
+        setToast(`Saved slot "${slotKey}"`)
+      }
+      void refreshStorageSlots()
     } catch (error) {
-      setToast('Save failed')
+      if (!options?.silent) {
+        setToast('Save failed')
+      }
     }
   }
 
-  const loadGraph = async () => {
+  const deleteSlot = async (slotKey: string) => {
     try {
+      const db = await openDB()
+      const tx = db.transaction(['graphs', 'textures', 'assets'], 'readwrite')
+      tx.objectStore('graphs').delete(slotKey)
+      await clearSlotEntries(tx.objectStore('textures'), slotKey)
+      await clearSlotEntries(tx.objectStore('assets'), slotKey)
+      await new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve(null)
+        tx.onerror = () => reject(tx.error)
+      })
+      setToast(`Deleted slot "${slotKey}"`)
+      void refreshStorageSlots()
+    } catch (error) {
+      setToast('Delete failed')
+    }
+  }
+
+  const clearSlot = async (slotKey: string) => {
+    try {
+      const db = await openDB()
+      const tx = db.transaction(['graphs', 'textures', 'assets'], 'readwrite')
+      tx.objectStore('graphs').delete(slotKey)
+      await clearSlotEntries(tx.objectStore('textures'), slotKey)
+      await clearSlotEntries(tx.objectStore('assets'), slotKey)
+      await new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve(null)
+        tx.onerror = () => reject(tx.error)
+      })
+      void refreshStorageSlots()
+    } catch (error) {
+      setToast('Clear failed')
+    }
+  }
+
+  const loadGraphWithSlot = async (
+    slotKey: string,
+    options?: { silent?: boolean },
+  ) => {
+    try {
+      isHydratingRef.current = true
       const db = await openDB()
       const tx = db.transaction(['graphs', 'textures', 'assets'], 'readonly')
       const graphs = tx.objectStore('graphs')
@@ -2746,18 +3790,37 @@ function App() {
             groups?: GraphGroup[]
             functions?: Record<string, FunctionDefinition>
             ui?: { paletteOpen?: Record<string, boolean> }
+            version?: number
           }
         | null
       >(
         (resolve, reject) => {
-          const getReq = graphs.get(storageKey)
+          const getReq = graphs.get(slotKey)
           getReq.onsuccess = () => resolve(getReq.result ?? null)
           getReq.onerror = () => reject(getReq.error)
         },
       )
 
       if (!record?.nodes || !record?.connections) {
-        setToast('No saved graph')
+        if (!options?.silent) {
+          setToast('Loaded example graph')
+        }
+        Object.values(objectUrlRef.current).forEach((url) => URL.revokeObjectURL(url))
+        objectUrlRef.current = {}
+        pendingExampleLayoutRef.current = true
+        setNodes(exampleGraph.nodes as GraphNode[])
+        setConnections(exampleGraph.connections as GraphConnection[])
+        setGroups((exampleGraph.groups ?? []) as GraphGroup[])
+        setFunctions((exampleGraph.functions ?? {}) as Record<string, FunctionDefinition>)
+        setPaletteOpen({
+          ...paletteDefaults,
+          ...(exampleGraph.ui?.paletteOpen ?? {}),
+        })
+        setSelectedNodeIds([])
+        setTimeout(() => {
+          isHydratingRef.current = false
+        }, 0)
+        void refreshStorageSlots()
         return
       }
 
@@ -2768,12 +3831,10 @@ function App() {
         record.nodes.map(async (node) => {
           if (node.type === 'texture') {
             const key = node.textureKey ?? node.id
-            const record = await new Promise<{ blob?: Blob; name?: string } | null>(
-              (resolve, reject) => {
-                const getReq = textures.get(key)
-                getReq.onsuccess = () => resolve(getReq.result ?? null)
-                getReq.onerror = () => reject(getReq.error)
-              },
+            const record = await getSlotRecord<{ blob?: Blob; name?: string }>(
+              textures,
+              slotKey,
+              key,
             )
             const blob = record?.blob ?? null
             if (!blob) return { ...node, value: '' }
@@ -2787,12 +3848,10 @@ function App() {
           }
           if (node.type === 'gltf' || node.type === 'gltfMaterial' || node.type === 'gltfTexture') {
             const key = node.assetKey ?? node.id
-            const record = await new Promise<{ blob?: Blob; name?: string } | null>(
-              (resolve, reject) => {
-                const getReq = assets.get(key)
-                getReq.onsuccess = () => resolve(getReq.result ?? null)
-                getReq.onerror = () => reject(getReq.error)
-              },
+            const record = await getSlotRecord<{ blob?: Blob; name?: string }>(
+              assets,
+              slotKey,
+              key,
             )
             const blob = record?.blob ?? null
             if (!blob) return { ...node, value: '' }
@@ -2807,37 +3866,82 @@ function App() {
           return node
         }),
       )
-
-      setNodes(hydratedNodes)
-      setConnections(record.connections)
+      const sanitizedConnections = sanitizeConnections(record.connections, hydratedNodes)
+      const migrated = migrateGraph(
+        hydratedNodes,
+        sanitizedConnections,
+        record.version ?? 0,
+      )
+      setNodes(migrated.nodes)
+      setConnections(migrated.connections)
       setGroups(record.groups ?? [])
       setFunctions(record.functions ?? {})
       setPaletteOpen({ ...paletteDefaults, ...(record.ui?.paletteOpen ?? {}) })
       setSelectedNodeIds([])
-      setToast('Loaded from IndexedDB')
+      setTimeout(() => {
+        isHydratingRef.current = false
+      }, 0)
+      if (!options?.silent) {
+        setToast(`Loaded slot "${slotKey}"`)
+      }
+      void refreshStorageSlots()
     } catch (error) {
-      setToast('Load failed')
+      if (!options?.silent) {
+        setToast('Load failed')
+      }
+      isHydratingRef.current = false
     }
   }
 
-  const clearSavedGraph = async () => {
-    try {
-      const db = await openDB()
-      const tx = db.transaction(['graphs', 'textures', 'assets'], 'readwrite')
-      tx.objectStore('graphs').delete(storageKey)
-      tx.objectStore('textures').clear()
-      tx.objectStore('assets').clear()
-      await new Promise((resolve, reject) => {
-        tx.oncomplete = () => resolve(null)
-        tx.onerror = () => reject(tx.error)
-      })
-      Object.values(objectUrlRef.current).forEach((url) => URL.revokeObjectURL(url))
-      objectUrlRef.current = {}
-      setToast('Cleared saved graph')
-    } catch (error) {
-      setToast('Clear failed')
+  useEffect(() => {
+    const lastSlot = localStorage.getItem(lastSlotStorageKey)
+    if (!lastSlot) return
+    const normalized = normalizeSlot(lastSlot)
+    setStorageSlot(normalized)
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem(lastSlotStorageKey, storageSlot)
+  }, [storageSlot, lastSlotStorageKey])
+
+  useEffect(() => {
+    if (!storageSlot) return
+    const previous = historySlotRef.current
+    if (previous !== storageSlot) {
+      historyBySlotRef.current[previous] = cloneHistoryState(historyRef.current)
+      const stored = historyBySlotRef.current[storageSlot]
+      historyRef.current = stored
+        ? cloneHistoryState(stored)
+        : { past: [], future: [], last: null, lastSig: null }
+      historyPendingRef.current = null
+      if (historyTimerRef.current) {
+        window.clearTimeout(historyTimerRef.current)
+        historyTimerRef.current = null
+      }
+      historySlotRef.current = storageSlot
+      setHistoryTick((prev) => prev + 1)
     }
-  }
+  }, [storageSlot])
+
+  useEffect(() => {
+    if (!storageSlot) return
+    void loadGraphWithSlot(normalizeSlot(storageSlot), { silent: true })
+  }, [storageSlot])
+
+  useEffect(() => {
+    if (isHydratingRef.current) return
+    if (autoSaveTimerRef.current) {
+      window.clearTimeout(autoSaveTimerRef.current)
+    }
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      void saveGraphWithSlot(normalizeSlot(storageSlot), { silent: true })
+    }, 600)
+    return () => {
+      if (autoSaveTimerRef.current) {
+        window.clearTimeout(autoSaveTimerRef.current)
+      }
+    }
+  }, [nodes, connections, groups, functions, paletteOpen, storageSlot])
 
   const groupSelectedNodes = () => {
     if (isFunctionEditing) {
@@ -3341,15 +4445,24 @@ function App() {
       }
     })
     const cards = container.querySelectorAll<HTMLElement>('.node-card[data-node-id]')
+    const scale = view.zoom || 1
     cards.forEach((card) => {
       const id = card.dataset.nodeId
       if (!id) return
+      const rect = card.getBoundingClientRect()
+      const width = card.offsetWidth || rect.width / scale
+      const height = card.offsetHeight || rect.height / scale
       sizeMap[id] = {
-        width: card.offsetWidth || card.getBoundingClientRect().width,
-        height: card.offsetHeight || card.getBoundingClientRect().height,
+        width,
+        height,
       }
     })
+    nodeSizeRef.current = sizeMap
     setPinPositions(next)
+    if (!isFunctionEditing && pendingExampleLayoutRef.current) {
+      pendingExampleLayoutRef.current = false
+      setEditorNodes((prev) => spreadNodesByColumn(prev))
+    }
     if (!groups.length) {
       setGroupBounds((prev) => (Object.keys(prev).length ? {} : prev))
       return
@@ -3392,7 +4505,15 @@ function App() {
       }
     })
     setGroupBounds(nextBounds)
-  }, [nodes, connections, linkDraft, view, groups, isFunctionEditing])
+  }, [
+    nodes,
+    connections,
+    linkDraft,
+    view,
+    groups,
+    isFunctionEditing,
+    spreadNodesByColumn,
+  ])
 
   useEffect(() => {
     nodesRef.current = editorNodes
@@ -7236,6 +8357,326 @@ function App() {
         cache.set(key, out)
         return out
       }
+      if (node.type === 'gltfTexture') {
+        const name = nextVar('tex')
+        const texId = getGltfTextureId(node.id)
+        decls.push(
+          `const ${name} = texture(uniformTexture(textureFromNode('${texId}')), uv());`,
+        )
+        const out = { expr: name, kind: 'color' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'gltfMaterial') {
+        const pin = outputPin ?? 'baseColor'
+        const entry = gltfMapRef.current[node.id]
+        const materialCount = entry?.materials?.length ?? 0
+        const material = materialCount
+          ? (entry?.materials?.[
+              getMaterialIndex(node, materialCount)
+            ] as GltfMaterial | undefined)
+          : undefined
+        const makeColor = (value?: Color, fallback = FALLBACK_COLOR_HEX) => {
+          const name = nextVar('col')
+          const hex = value ? `#${value.getHexString()}` : fallback
+          decls.push(`const ${name} = color('${hex}');`)
+          return { expr: name, kind: 'color' as const }
+        }
+        const makeNumber = (value: number) => {
+          const name = nextVar('num')
+          decls.push(`const ${name} = float(${value.toFixed(3)});`)
+          return { expr: name, kind: 'number' as const }
+        }
+        const makeVec2 = (value?: Vector2) => {
+          const name = nextVar('vec')
+          const x = value?.x ?? 1
+          const y = value?.y ?? 1
+          decls.push(`const ${name} = vec2(${x.toFixed(3)}, ${y.toFixed(3)});`)
+          return { expr: name, kind: 'vec2' as const }
+        }
+        const makeTexture = (tex: Texture | null | undefined, key: string) => {
+          if (!tex) return null
+          const name = nextVar('tex')
+          const id = getGltfMaterialTextureId(node.id, key)
+          decls.push(`const ${name} = texture(uniformTexture(textureFromNode('${id}')), uv());`)
+          return { expr: name, kind: 'color' as const }
+        }
+        if (!material) {
+          if (pin === 'normalScale') {
+            const out = makeVec2()
+            cache.set(key, out)
+            return out
+          }
+          if (
+            pin === 'roughness' ||
+            pin === 'metalness' ||
+            pin === 'emissiveIntensity' ||
+            pin === 'clearcoat' ||
+            pin === 'clearcoatRoughness' ||
+            pin === 'sheenRoughness' ||
+            pin === 'iridescence' ||
+            pin === 'iridescenceIOR' ||
+            pin === 'iridescenceThickness' ||
+            pin === 'ior' ||
+            pin === 'transmission'
+          ) {
+            const out = makeNumber(0)
+            cache.set(key, out)
+            return out
+          }
+          const out = makeColor()
+          cache.set(key, out)
+          return out
+        }
+        const pbr = material.pbrMetallicRoughness
+        if (pin === 'baseColor') {
+          const out = makeColor(pbr?.baseColorFactor ? new Color().fromArray(pbr.baseColorFactor) : undefined)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'baseColorTexture') {
+          const out =
+            makeTexture(pbr?.baseColorTexture?.texture, 'baseColorTexture') ??
+            makeColor(new Color(1, 1, 1))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'roughness') {
+          const out = makeNumber(pbr?.roughnessFactor ?? 1)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'metalness') {
+          const out = makeNumber(pbr?.metallicFactor ?? 1)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'roughnessMap') {
+          const out = makeTexture(pbr?.metallicRoughnessTexture?.texture, 'roughnessMap')
+          if (out) {
+            cache.set(key, out)
+            return out
+          }
+          const fallback = makeColor(new Color(1, 1, 1))
+          cache.set(key, fallback)
+          return fallback
+        }
+        if (pin === 'metalnessMap') {
+          const out = makeTexture(pbr?.metallicRoughnessTexture?.texture, 'metalnessMap')
+          if (out) {
+            cache.set(key, out)
+            return out
+          }
+          const fallback = makeColor(new Color(1, 1, 1))
+          cache.set(key, fallback)
+          return fallback
+        }
+        if (pin === 'emissive') {
+          const emissiveFactor = material.emissiveFactor
+          const out = makeColor(
+            emissiveFactor ? new Color().fromArray(emissiveFactor) : new Color(0, 0, 0),
+          )
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'emissiveMap') {
+          const out =
+            makeTexture(material.emissiveTexture?.texture, 'emissiveMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'emissiveIntensity') {
+          const emissiveStrength = material.emissiveStrength
+          const out = makeNumber(emissiveStrength ?? 1)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'normalMap') {
+          const out =
+            makeTexture(material.normalTexture?.texture, 'normalMap') ??
+            makeColor(new Color(0.5, 0.5, 1))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'normalScale') {
+          const out = makeVec2(material.normalTexture?.scale)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'occlusionMap') {
+          const out =
+            makeTexture(material.occlusionTexture?.texture, 'occlusionMap') ??
+            makeColor(new Color(1, 1, 1))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'aoMapIntensity') {
+          const out = makeNumber(material.occlusionTexture?.strength ?? 1)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'clearcoat') {
+          const out = makeNumber(material.clearcoatFactor ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'clearcoatMap') {
+          const out =
+            makeTexture(material.clearcoatTexture?.texture, 'clearcoatMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'clearcoatRoughness') {
+          const out = makeNumber(material.clearcoatRoughnessFactor ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'clearcoatRoughnessMap') {
+          const out =
+            makeTexture(material.clearcoatRoughnessTexture?.texture, 'clearcoatRoughnessMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'clearcoatNormalMap') {
+          const out =
+            makeTexture(material.clearcoatNormalTexture?.texture, 'clearcoatNormalMap') ??
+            makeColor(new Color(0.5, 0.5, 1))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'sheen') {
+          const sheenFactor = material.sheenColorFactor
+          const out = makeColor(
+            sheenFactor ? new Color().fromArray(sheenFactor) : new Color(0, 0, 0),
+          )
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'sheenColorMap') {
+          const out =
+            makeTexture(material.sheenColorTexture?.texture, 'sheenColorMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'sheenRoughness') {
+          const out = makeNumber(material.sheenRoughnessFactor ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'sheenRoughnessMap') {
+          const out =
+            makeTexture(material.sheenRoughnessTexture?.texture, 'sheenRoughnessMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'iridescence') {
+          const out = makeNumber(material.iridescenceFactor ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'iridescenceMap') {
+          const out =
+            makeTexture(material.iridescenceTexture?.texture, 'iridescenceMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'iridescenceIOR') {
+          const out = makeNumber(material.iridescenceIOR ?? 1.3)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'iridescenceThickness') {
+          const range = material.iridescenceThicknessRange
+          const out = makeNumber(range ? range[1] : 400)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'iridescenceThicknessMap') {
+          const out =
+            makeTexture(material.iridescenceThicknessTexture?.texture, 'iridescenceThicknessMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'ior') {
+          const out = makeNumber(material.ior ?? 1.5)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'transmission') {
+          const out = makeNumber(material.transmissionFactor ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'transmissionMap') {
+          const out =
+            makeTexture(material.transmissionTexture?.texture, 'transmissionMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'thickness') {
+          const out = makeNumber(material.thicknessFactor ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'thicknessMap') {
+          const out =
+            makeTexture(material.thicknessTexture?.texture, 'thicknessMap') ??
+            makeColor(new Color(0, 0, 0))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'attenuationColor') {
+          const attenuationColor = material.attenuationColor
+          const out = makeColor(
+            attenuationColor ? new Color().fromArray(attenuationColor) : new Color(1, 1, 1),
+          )
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'attenuationDistance') {
+          const out = makeNumber(material.attenuationDistance ?? 0)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'specularColor') {
+          const specularColor = material.specularColorFactor
+          const out = makeColor(
+            specularColor ? new Color().fromArray(specularColor) : new Color(1, 1, 1),
+          )
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'specularColorMap') {
+          const out =
+            makeTexture(material.specularColorTexture?.texture, 'specularColorMap') ??
+            makeColor(new Color(1, 1, 1))
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'specularIntensity') {
+          const out = makeNumber(material.specularFactor ?? 1)
+          cache.set(key, out)
+          return out
+        }
+        if (pin === 'specularIntensityMap') {
+          const out =
+            makeTexture(material.specularTexture?.texture, 'specularIntensityMap') ??
+            makeColor(new Color(1, 1, 1))
+          cache.set(key, out)
+          return out
+        }
+        const out = makeColor()
+        cache.set(key, out)
+        return out
+      }
 
       if (node.type === 'gltfTexture') {
         const name = nextVar('tex')
@@ -7594,8 +9035,18 @@ function App() {
       }
 
       if (node.type === 'add' || node.type === 'multiply') {
-        const left = getInput('a') ?? { expr: 'float(0.0)', kind: 'number' as const }
-        const right = getInput('b') ?? { expr: 'float(0.0)', kind: 'number' as const }
+        const left =
+          getInput('a') ??
+          {
+            expr: node.type === 'add' ? 'float(0.0)' : 'float(1.0)',
+            kind: 'number' as const,
+          }
+        const right =
+          getInput('b') ??
+          {
+            expr: node.type === 'add' ? 'float(0.0)' : 'float(1.0)',
+            kind: 'number' as const,
+          }
         const op = node.type === 'add' ? '+' : '*'
         const combined = combineTypes(left.kind, right.kind)
         if (combined === 'unknown') {
@@ -7639,6 +9090,397 @@ function App() {
         const name = nextVar('num')
         decls.push(`const ${name} = ${expr};`)
         const out = { expr: name, kind: 'number' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'normalize') {
+        const input = getInput('value')
+        if (!input || !isVectorKind(input.kind)) {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        const expr = `normalize(${input.expr})`
+        const name = nextVar('vec')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind: input.kind as 'color' | 'vec2' | 'vec3' | 'vec4' }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'dot') {
+        const inputA = getInput('a')
+        const inputB = getInput('b')
+        const vecA = getVectorKind(inputA?.kind ?? 'unknown')
+        const vecB = getVectorKind(inputB?.kind ?? 'unknown')
+        if (!inputA || !inputB || !vecA || !vecB || vecA !== vecB) {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        const expr = `dot(${inputA.expr}, ${inputB.expr})`
+        const name = nextVar('num')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind: 'number' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'cross') {
+        const inputA = getInput('a')
+        const inputB = getInput('b')
+        const vecA = getVectorKind(inputA?.kind ?? 'unknown')
+        const vecB = getVectorKind(inputB?.kind ?? 'unknown')
+        if (!inputA || !inputB || vecA !== 'vec3' || vecB !== 'vec3') {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        const expr = `cross(${inputA.expr}, ${inputB.expr})`
+        const name = nextVar('vec')
+        decls.push(`const ${name} = ${expr};`)
+        const kind: 'color' | 'vec3' =
+          inputA.kind === 'color' || inputB.kind === 'color' ? 'color' : 'vec3'
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'checker') {
+        const input = getInput('coord')
+        const expr =
+          input?.kind === 'vec2'
+            ? input.expr
+            : input?.kind === 'number'
+              ? asVec2(input.expr, 'number')
+              : 'uv()'
+        const name = nextVar('num')
+        decls.push(`const ${name} = checker(${expr});`)
+        const out = { expr: name, kind: 'number' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'dFdx' || node.type === 'dFdy' || node.type === 'fwidth') {
+        const input = getInput('value')
+        if (!input || (!isVectorKind(input.kind) && input.kind !== 'number')) {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        const fn = node.type === 'dFdx' ? 'dFdx' : node.type === 'dFdy' ? 'dFdy' : 'fwidth'
+        const name = nextVar(input.kind === 'number' ? 'num' : 'vec')
+        decls.push(`const ${name} = ${fn}(${input.expr});`)
+        const out = { expr: name, kind: input.kind }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'distance') {
+        const inputA = getInput('a')
+        const inputB = getInput('b')
+        const kind = resolveVectorOutputKind([
+          inputA?.kind ?? 'number',
+          inputB?.kind ?? 'number',
+        ])
+        if (kind === 'unknown') {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        let exprA = inputA?.expr ?? 'float(0.0)'
+        let exprB = inputB?.expr ?? 'float(0.0)'
+        if (kind === 'color') {
+          exprA =
+            inputA?.kind === 'color'
+              ? inputA.expr
+              : inputA?.kind === 'number'
+                ? asColor(inputA.expr, 'number')
+                : 'color(0.0)'
+          exprB =
+            inputB?.kind === 'color'
+              ? inputB.expr
+              : inputB?.kind === 'number'
+                ? asColor(inputB.expr, 'number')
+                : 'color(0.0)'
+        } else if (kind === 'vec2') {
+          exprA =
+            inputA?.kind === 'vec2'
+              ? inputA.expr
+              : inputA?.kind === 'number'
+                ? asVec2(inputA.expr, 'number')
+                : 'vec2(0.0, 0.0)'
+          exprB =
+            inputB?.kind === 'vec2'
+              ? inputB.expr
+              : inputB?.kind === 'number'
+                ? asVec2(inputB.expr, 'number')
+                : 'vec2(0.0, 0.0)'
+        } else if (kind === 'vec3') {
+          exprA =
+            inputA?.kind === 'vec3'
+              ? inputA.expr
+              : inputA?.kind === 'number'
+                ? asVec3(inputA.expr, 'number')
+                : 'vec3(0.0, 0.0, 0.0)'
+          exprB =
+            inputB?.kind === 'vec3'
+              ? inputB.expr
+              : inputB?.kind === 'number'
+                ? asVec3(inputB.expr, 'number')
+                : 'vec3(0.0, 0.0, 0.0)'
+        } else if (kind === 'vec4') {
+          exprA =
+            inputA?.kind === 'vec4'
+              ? inputA.expr
+              : inputA?.kind === 'number'
+                ? asVec4(inputA.expr, 'number')
+                : 'vec4(0.0, 0.0, 0.0, 1.0)'
+          exprB =
+            inputB?.kind === 'vec4'
+              ? inputB.expr
+              : inputB?.kind === 'number'
+                ? asVec4(inputB.expr, 'number')
+                : 'vec4(0.0, 0.0, 0.0, 1.0)'
+        }
+        const expr = `distance(${exprA}, ${exprB})`
+        const name = nextVar('num')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind: 'number' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'reflect' || node.type === 'refract' || node.type === 'faceforward') {
+        const toVec3Expr = (
+          input: {
+            expr: string
+            kind: 'color' | 'number' | 'vec2' | 'vec3' | 'vec4' | 'mat2' | 'mat3' | 'mat4'
+          } | null,
+        ) => {
+          if (!input) return 'vec3(0.0, 0.0, 0.0)'
+          if (input.kind === 'vec3' || input.kind === 'color') return input.expr
+          if (input.kind === 'number') return asVec3(input.expr, 'number')
+          return 'vec3(0.0, 0.0, 0.0)'
+        }
+        if (node.type === 'reflect') {
+          const incident = getInput('incident')
+          const normal = getInput('normal')
+          const expr = `reflect(${toVec3Expr(incident)}, ${toVec3Expr(normal)})`
+          const name = nextVar('vec')
+          decls.push(`const ${name} = ${expr};`)
+          const kind: 'color' | 'vec3' =
+            incident?.kind === 'color' || normal?.kind === 'color' ? 'color' : 'vec3'
+          const out = { expr: name, kind }
+          cache.set(key, out)
+          return out
+        }
+        if (node.type === 'refract') {
+          const incident = getInput('incident')
+          const normal = getInput('normal')
+          const eta = getInput('eta')
+          const etaExpr = eta?.kind === 'number' ? eta.expr : 'float(1.0)'
+          const expr = `refract(${toVec3Expr(incident)}, ${toVec3Expr(normal)}, ${etaExpr})`
+          const name = nextVar('vec')
+          decls.push(`const ${name} = ${expr};`)
+          const kind: 'color' | 'vec3' =
+            incident?.kind === 'color' || normal?.kind === 'color' ? 'color' : 'vec3'
+          const out = { expr: name, kind }
+          cache.set(key, out)
+          return out
+        }
+        const n = getInput('n')
+        const i = getInput('i')
+        const nref = getInput('nref')
+        const expr = `faceforward(${toVec3Expr(n)}, ${toVec3Expr(i)}, ${toVec3Expr(nref)})`
+        const name = nextVar('vec')
+        decls.push(`const ${name} = ${expr};`)
+        const kind: 'color' | 'vec3' =
+          n?.kind === 'color' || i?.kind === 'color' || nref?.kind === 'color'
+            ? 'color'
+            : 'vec3'
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'triNoise3D') {
+        const inputPosition = getInput('position')
+        const inputSpeed = getInput('speed')
+        const inputTime = getInput('time')
+        const positionExpr =
+          inputPosition?.kind === 'vec3'
+            ? inputPosition.expr
+            : inputPosition?.kind === 'number'
+              ? asVec3(inputPosition.expr, 'number')
+              : 'positionLocal'
+        const speedExpr = inputSpeed?.kind === 'number' ? inputSpeed.expr : 'float(1.0)'
+        const timeExpr = inputTime?.kind === 'number' ? inputTime.expr : 'timeUniform'
+        const name = nextVar('num')
+        decls.push(`const ${name} = triNoise3D(${positionExpr}, ${speedExpr}, ${timeExpr});`)
+        const out = { expr: name, kind: 'number' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'mxNoiseFloat' || node.type === 'mxNoiseVec3' || node.type === 'mxNoiseVec4') {
+        const texcoord = getInput('texcoord')
+        const amplitude = getInput('amplitude')
+        const pivot = getInput('pivot')
+        const coordExpr = texcoord
+          ? texcoord.kind === 'vec3' || texcoord.kind === 'color' || texcoord.kind === 'vec4'
+            ? toVec3Expr(texcoord)
+            : toVec2Expr(texcoord)
+          : 'uv()'
+        const amplitudeExpr = amplitude?.kind === 'number' ? amplitude.expr : 'float(1.0)'
+        const pivotExpr = pivot?.kind === 'number' ? pivot.expr : 'float(0.0)'
+        const fn =
+          node.type === 'mxNoiseFloat'
+            ? 'mx_noise_float'
+            : node.type === 'mxNoiseVec3'
+              ? 'mx_noise_vec3'
+              : 'mx_noise_vec4'
+        const name = nextVar(node.type === 'mxNoiseFloat' ? 'num' : 'vec')
+        decls.push(`const ${name} = ${fn}(${coordExpr}, ${amplitudeExpr}, ${pivotExpr});`)
+        const kind =
+          node.type === 'mxNoiseFloat'
+            ? ('number' as const)
+            : node.type === 'mxNoiseVec3'
+              ? ('vec3' as const)
+              : ('vec4' as const)
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (
+        node.type === 'mxFractalNoiseFloat' ||
+        node.type === 'mxFractalNoiseVec2' ||
+        node.type === 'mxFractalNoiseVec3' ||
+        node.type === 'mxFractalNoiseVec4'
+      ) {
+        const position = getInput('position')
+        const octaves = getInput('octaves')
+        const lacunarity = getInput('lacunarity')
+        const diminish = getInput('diminish')
+        const amplitude = getInput('amplitude')
+        const positionExpr = position
+          ? position.kind === 'vec3' || position.kind === 'color' || position.kind === 'vec4'
+            ? toVec3Expr(position)
+            : toVec2Expr(position)
+          : 'uv()'
+        const octavesExpr = octaves?.kind === 'number' ? octaves.expr : 'float(3.0)'
+        const lacunarityExpr = lacunarity?.kind === 'number' ? lacunarity.expr : 'float(2.0)'
+        const diminishExpr = diminish?.kind === 'number' ? diminish.expr : 'float(0.5)'
+        const amplitudeExpr = amplitude?.kind === 'number' ? amplitude.expr : 'float(1.0)'
+        const fn =
+          node.type === 'mxFractalNoiseFloat'
+            ? 'mx_fractal_noise_float'
+            : node.type === 'mxFractalNoiseVec2'
+              ? 'mx_fractal_noise_vec2'
+              : node.type === 'mxFractalNoiseVec3'
+                ? 'mx_fractal_noise_vec3'
+                : 'mx_fractal_noise_vec4'
+        const name = nextVar(
+          node.type === 'mxFractalNoiseFloat' ? 'num' : 'vec',
+        )
+        decls.push(
+          `const ${name} = ${fn}(${positionExpr}, ${octavesExpr}, ${lacunarityExpr}, ${diminishExpr}, ${amplitudeExpr});`,
+        )
+        const kind =
+          node.type === 'mxFractalNoiseFloat'
+            ? ('number' as const)
+            : node.type === 'mxFractalNoiseVec2'
+              ? ('vec2' as const)
+              : node.type === 'mxFractalNoiseVec3'
+                ? ('vec3' as const)
+                : ('vec4' as const)
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (
+        node.type === 'mxWorleyNoiseFloat' ||
+        node.type === 'mxWorleyNoiseVec2' ||
+        node.type === 'mxWorleyNoiseVec3'
+      ) {
+        const texcoord = getInput('texcoord')
+        const jitter = getInput('jitter')
+        const coordExpr = texcoord
+          ? texcoord.kind === 'vec3' || texcoord.kind === 'color' || texcoord.kind === 'vec4'
+            ? toVec3Expr(texcoord)
+            : toVec2Expr(texcoord)
+          : 'uv()'
+        const jitterExpr = jitter?.kind === 'number' ? jitter.expr : 'float(1.0)'
+        const fn =
+          node.type === 'mxWorleyNoiseFloat'
+            ? 'mx_worley_noise_float'
+            : node.type === 'mxWorleyNoiseVec2'
+              ? 'mx_worley_noise_vec2'
+              : 'mx_worley_noise_vec3'
+        const name = nextVar(node.type === 'mxWorleyNoiseFloat' ? 'num' : 'vec')
+        decls.push(`const ${name} = ${fn}(${coordExpr}, ${jitterExpr});`)
+        const kind =
+          node.type === 'mxWorleyNoiseFloat'
+            ? ('number' as const)
+            : node.type === 'mxWorleyNoiseVec2'
+              ? ('vec2' as const)
+              : ('vec3' as const)
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'rotateUV') {
+        const uvInput = getInput('uv')
+        const rotation = getInput('rotation')
+        const center = getInput('center')
+        const uvExpr = toVec2Expr(uvInput ?? { expr: 'uv()', kind: 'vec2' })
+        const rotationExpr = rotation?.kind === 'number' ? rotation.expr : 'float(0.0)'
+        const centerExpr = center ? toVec2Expr(center) : 'vec2(0.5, 0.5)'
+        const name = nextVar('vec')
+        decls.push(`const ${name} = rotateUV(${uvExpr}, ${rotationExpr}, ${centerExpr});`)
+        const out = { expr: name, kind: 'vec2' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'scaleUV') {
+        const uvInput = getInput('uv')
+        const scale = getInput('scale')
+        const uvExpr = toVec2Expr(uvInput ?? { expr: 'uv()', kind: 'vec2' })
+        const scaleExpr = scale ? toVec2Expr(scale) : 'vec2(1.0, 1.0)'
+        const name = nextVar('vec')
+        decls.push(`const ${name} = (${uvExpr} * ${scaleExpr});`)
+        const out = { expr: name, kind: 'vec2' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'offsetUV') {
+        const uvInput = getInput('uv')
+        const offset = getInput('offset')
+        const uvExpr = toVec2Expr(uvInput ?? { expr: 'uv()', kind: 'vec2' })
+        const offsetExpr = offset ? toVec2Expr(offset) : 'vec2(0.0, 0.0)'
+        const name = nextVar('vec')
+        decls.push(`const ${name} = (${uvExpr} + ${offsetExpr});`)
+        const out = { expr: name, kind: 'vec2' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'spherizeUV') {
+        const uvInput = getInput('uv')
+        const strength = getInput('strength')
+        const center = getInput('center')
+        const uvExpr = toVec2Expr(uvInput ?? { expr: 'uv()', kind: 'vec2' })
+        const strengthExpr = strength?.kind === 'number' ? strength.expr : 'float(0.0)'
+        const centerExpr = center ? toVec2Expr(center) : 'vec2(0.5, 0.5)'
+        const name = nextVar('vec')
+        decls.push(
+          `const ${name} = spherizeUV(${uvExpr}, ${strengthExpr}, ${centerExpr});`,
+        )
+        const out = { expr: name, kind: 'vec2' as const }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'spritesheetUV') {
+        const sizeInput = getInput('size')
+        const uvInput = getInput('uv')
+        const time = getInput('time')
+        const sizeExpr = sizeInput ? toVec2Expr(sizeInput) : 'vec2(1.0, 1.0)'
+        const uvExpr = toVec2Expr(uvInput ?? { expr: 'uv()', kind: 'vec2' })
+        const timeExpr = time?.kind === 'number' ? time.expr : 'float(0.0)'
+        const name = nextVar('vec')
+        decls.push(`const ${name} = spritesheetUV(${sizeExpr}, ${uvExpr}, ${timeExpr});`)
+        const out = { expr: name, kind: 'vec2' as const }
         cache.set(key, out)
         return out
       }
@@ -10677,7 +12519,7 @@ function App() {
 
     const nextVar = (prefix: string) => `${prefix}_${varIndex++}`
     const asColor = (expr: string, kind: 'color' | 'number') =>
-      kind === 'color' ? expr : `color(${expr})`
+      kind === 'color' ? expr : `color(${expr}, ${expr}, ${expr})`
     const asVec2 = (expr: string, kind: 'vec2' | 'number') =>
       kind === 'vec2' ? expr : `vec2(${expr}, ${expr})`
     const asVec3 = (expr: string, kind: 'vec3' | 'number') =>
@@ -10789,8 +12631,18 @@ function App() {
       }
 
       if (node.type === 'add' || node.type === 'multiply') {
-        const left = getInput('a') ?? { expr: 'float(0.0)', kind: 'number' as const }
-        const right = getInput('b') ?? { expr: 'float(0.0)', kind: 'number' as const }
+        const left =
+          getInput('a') ??
+          {
+            expr: node.type === 'add' ? 'float(0.0)' : 'float(1.0)',
+            kind: 'number' as const,
+          }
+        const right =
+          getInput('b') ??
+          {
+            expr: node.type === 'add' ? 'float(0.0)' : 'float(1.0)',
+            kind: 'number' as const,
+          }
         const op = node.type === 'add' ? 'add' : 'mul'
         const combined = combineTypes(left.kind, right.kind)
         if (combined === 'unknown') {
@@ -10817,6 +12669,69 @@ function App() {
         const name = nextVar(combined === 'number' ? 'num' : 'vec')
         decls.push(`const ${name} = ${expr};`)
         const out = { expr: name, kind: combined }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'ifElse') {
+        const inputCond = getInput('cond')
+        const inputA = getInput('a')
+        const inputB = getInput('b')
+        const inputThreshold = getInput('threshold')
+        const combined = combineTypes(inputA?.kind ?? 'number', inputB?.kind ?? 'number')
+        if (combined === 'unknown' || isMatrixKind(combined)) {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        const outputKind = combined as 'number' | 'color' | 'vec2' | 'vec3' | 'vec4'
+        const toKindExpr = (
+          entry: typeof inputA,
+          kind: 'number' | 'color' | 'vec2' | 'vec3' | 'vec4',
+          fallback: number,
+        ) => {
+          if (kind === 'number') {
+            return entry?.kind === 'number' ? entry.expr : `float(${fallback.toFixed(1)})`
+          }
+          if (entry?.kind === kind) return entry.expr
+          if (entry?.kind === 'number') {
+            if (kind === 'color') return asColor(entry.expr, 'number')
+            if (kind === 'vec2') return asVec2(entry.expr, 'number')
+            if (kind === 'vec3') return asVec3(entry.expr, 'number')
+            return asVec4(entry.expr, 'number')
+          }
+          if (kind === 'color') return `color(${fallback.toFixed(1)})`
+          if (kind === 'vec2') return `vec2(${fallback.toFixed(1)}, ${fallback.toFixed(1)})`
+          if (kind === 'vec3') return `vec3(${fallback.toFixed(1)}, ${fallback.toFixed(1)}, ${fallback.toFixed(1)})`
+          return `vec4(${fallback.toFixed(1)}, ${fallback.toFixed(1)}, ${fallback.toFixed(1)}, ${fallback.toFixed(1)})`
+        }
+        const exprA = toKindExpr(inputA, outputKind, 1)
+        const exprB = toKindExpr(inputB, outputKind, 0)
+        const condExpr = (() => {
+          if (!inputCond) return 'float(0.0)'
+          if (outputKind === 'number') {
+            if (inputCond.kind === 'number') return inputCond.expr
+            if (isVectorKind(inputCond.kind)) return `length(${inputCond.expr})`
+            return 'float(0.0)'
+          }
+          if (outputKind === 'vec2') return toVec2Expr(inputCond)
+          if (outputKind === 'vec4') return toVec4Expr(inputCond)
+          return toVec3Expr(inputCond)
+        })()
+        const thresholdExpr =
+          inputThreshold?.kind === 'number' ? inputThreshold.expr : 'float(0.5)'
+        const thresholdValue =
+          outputKind === 'number'
+            ? thresholdExpr
+            : outputKind === 'vec2'
+              ? `vec2(${thresholdExpr}, ${thresholdExpr})`
+              : outputKind === 'vec4'
+                ? `vec4(${thresholdExpr}, ${thresholdExpr}, ${thresholdExpr}, ${thresholdExpr})`
+                : `vec3(${thresholdExpr}, ${thresholdExpr}, ${thresholdExpr})`
+        const mask = `greaterThan(${condExpr}, ${thresholdValue})`
+        const expr = `select(${mask}, ${exprA}, ${exprB})`
+        const name = nextVar(outputKind === 'number' ? 'num' : outputKind === 'color' ? 'col' : 'vec')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind: outputKind }
         cache.set(key, out)
         return out
       }
@@ -11499,6 +13414,192 @@ function App() {
         const name = nextVar(combined === 'number' ? 'num' : 'vec')
         decls.push(`const ${name} = ${expr};`)
         const out = { expr: name, kind: combined }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'smoothstep') {
+        const edge0Input = getInput('edge0')
+        const edge1Input = getInput('edge1')
+        const xInput = getInput('x')
+        const kind = resolveVectorOutputKind([
+          edge0Input?.kind ?? 'number',
+          edge1Input?.kind ?? 'number',
+          xInput?.kind ?? 'number',
+        ])
+        if (kind === 'unknown') {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        let exprEdge0 = edge0Input?.expr ?? 'float(0.0)'
+        let exprEdge1 = edge1Input?.expr ?? 'float(1.0)'
+        let exprX = xInput?.expr ?? 'float(0.0)'
+        if (kind === 'color') {
+          exprEdge0 =
+            edge0Input?.kind === 'color'
+              ? edge0Input.expr
+              : edge0Input?.kind === 'number'
+                ? asColor(edge0Input.expr, 'number')
+                : 'color(0.0)'
+          exprEdge1 =
+            edge1Input?.kind === 'color'
+              ? edge1Input.expr
+              : edge1Input?.kind === 'number'
+                ? asColor(edge1Input.expr, 'number')
+                : 'color(1.0)'
+          exprX =
+            xInput?.kind === 'color'
+              ? xInput.expr
+              : xInput?.kind === 'number'
+                ? asColor(xInput.expr, 'number')
+                : 'color(0.0)'
+        } else if (kind === 'vec2') {
+          exprEdge0 =
+            edge0Input?.kind === 'vec2'
+              ? edge0Input.expr
+              : edge0Input?.kind === 'number'
+                ? asVec2(edge0Input.expr, 'number')
+                : 'vec2(0.0, 0.0)'
+          exprEdge1 =
+            edge1Input?.kind === 'vec2'
+              ? edge1Input.expr
+              : edge1Input?.kind === 'number'
+                ? asVec2(edge1Input.expr, 'number')
+                : 'vec2(1.0, 1.0)'
+          exprX =
+            xInput?.kind === 'vec2'
+              ? xInput.expr
+              : xInput?.kind === 'number'
+                ? asVec2(xInput.expr, 'number')
+                : 'vec2(0.0, 0.0)'
+        } else if (kind === 'vec3') {
+          exprEdge0 =
+            edge0Input?.kind === 'vec3'
+              ? edge0Input.expr
+              : edge0Input?.kind === 'number'
+                ? asVec3(edge0Input.expr, 'number')
+                : 'vec3(0.0, 0.0, 0.0)'
+          exprEdge1 =
+            edge1Input?.kind === 'vec3'
+              ? edge1Input.expr
+              : edge1Input?.kind === 'number'
+                ? asVec3(edge1Input.expr, 'number')
+                : 'vec3(1.0, 1.0, 1.0)'
+          exprX =
+            xInput?.kind === 'vec3'
+              ? xInput.expr
+              : xInput?.kind === 'number'
+                ? asVec3(xInput.expr, 'number')
+                : 'vec3(0.0, 0.0, 0.0)'
+        } else if (kind === 'vec4') {
+          exprEdge0 =
+            edge0Input?.kind === 'vec4'
+              ? edge0Input.expr
+              : edge0Input?.kind === 'number'
+                ? asVec4(edge0Input.expr, 'number')
+                : 'vec4(0.0, 0.0, 0.0, 1.0)'
+          exprEdge1 =
+            edge1Input?.kind === 'vec4'
+              ? edge1Input.expr
+              : edge1Input?.kind === 'number'
+                ? asVec4(edge1Input.expr, 'number')
+                : 'vec4(1.0, 1.0, 1.0, 1.0)'
+          exprX =
+            xInput?.kind === 'vec4'
+              ? xInput.expr
+              : xInput?.kind === 'number'
+                ? asVec4(xInput.expr, 'number')
+                : 'vec4(0.0, 0.0, 0.0, 1.0)'
+        }
+        const expr = `smoothstep(${exprEdge0}, ${exprEdge1}, ${exprX})`
+        const name = nextVar(kind === 'number' ? 'num' : 'vec')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'pow') {
+        const baseInput = getInput('base')
+        const expInput = getInput('exp')
+        const kind = resolveVectorOutputKind([
+          baseInput?.kind ?? 'number',
+          expInput?.kind ?? 'number',
+        ])
+        if (kind === 'unknown') {
+          const out = { expr: 'float(0.0)', kind: 'number' as const }
+          cache.set(key, out)
+          return out
+        }
+        let exprBase = baseInput?.expr ?? 'float(0.0)'
+        let exprExp = expInput?.expr ?? 'float(1.0)'
+        if (kind === 'color') {
+          exprBase =
+            baseInput?.kind === 'color'
+              ? baseInput.expr
+              : baseInput?.kind === 'number'
+                ? asColor(baseInput.expr, 'number')
+                : 'color(0.0)'
+          exprExp =
+            expInput?.kind === 'color'
+              ? expInput.expr
+              : expInput?.kind === 'number'
+                ? asColor(expInput.expr, 'number')
+                : 'color(1.0)'
+        } else if (kind === 'vec2') {
+          exprBase =
+            baseInput?.kind === 'vec2'
+              ? baseInput.expr
+              : baseInput?.kind === 'number'
+                ? asVec2(baseInput.expr, 'number')
+                : 'vec2(0.0, 0.0)'
+          exprExp =
+            expInput?.kind === 'vec2'
+              ? expInput.expr
+              : expInput?.kind === 'number'
+                ? asVec2(expInput.expr, 'number')
+                : 'vec2(1.0, 1.0)'
+        } else if (kind === 'vec3') {
+          exprBase =
+            baseInput?.kind === 'vec3'
+              ? baseInput.expr
+              : baseInput?.kind === 'number'
+                ? asVec3(baseInput.expr, 'number')
+                : 'vec3(0.0, 0.0, 0.0)'
+          exprExp =
+            expInput?.kind === 'vec3'
+              ? expInput.expr
+              : expInput?.kind === 'number'
+                ? asVec3(expInput.expr, 'number')
+                : 'vec3(1.0, 1.0, 1.0)'
+        } else if (kind === 'vec4') {
+          exprBase =
+            baseInput?.kind === 'vec4'
+              ? baseInput.expr
+              : baseInput?.kind === 'number'
+                ? asVec4(baseInput.expr, 'number')
+                : 'vec4(0.0, 0.0, 0.0, 1.0)'
+          exprExp =
+            expInput?.kind === 'vec4'
+              ? expInput.expr
+              : expInput?.kind === 'number'
+                ? asVec4(expInput.expr, 'number')
+                : 'vec4(1.0, 1.0, 1.0, 1.0)'
+        }
+        const expr = `pow(${exprBase}, ${exprExp})`
+        const name = nextVar(kind === 'number' ? 'num' : 'vec')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind }
+        cache.set(key, out)
+        return out
+      }
+      if (node.type === 'length') {
+        const input = getInput('value')
+        const valueExpr =
+          input && isVectorKind(input.kind) ? input.expr : 'vec3(0.0, 0.0, 0.0)'
+        const expr = `length(${valueExpr})`
+        const name = nextVar('num')
+        decls.push(`const ${name} = ${expr};`)
+        const out = { expr: name, kind: 'number' as const }
         cache.set(key, out)
         return out
       }
@@ -12465,6 +14566,7 @@ function App() {
             ``,
             `${exportPrefix}type TSLExportOptions = {`,
             ...(usesTextures ? [`  textures?: Record<string, Texture>;`] : []),
+            `  timeUniform?: ReturnType<typeof TSL.uniform>;`,
             `};`,
             ``,
             `${exportPrefix}const textureIds = ${JSON.stringify(allTextureIds, null, 2)};`,
@@ -12473,7 +14575,7 @@ function App() {
             `  options: TSLExportOptions = {},`,
             `): { material: ${materialReturnType}; uniforms: { time: ReturnType<typeof TSL.uniform> } } => {`,
             ...(usesTextures ? [`  const textures = options.textures ?? {};`] : []),
-            `  const timeUniform = TSL.uniform(0);`,
+            `  const timeUniform = options.timeUniform ?? TSL.uniform(0);`,
             ...(usesTextures
               ? [`  const textureFromNode = (id: string) => textures[id] ?? null;`]
               : [`  const textureFromNode = (_id: string) => null;`]),
@@ -12492,7 +14594,7 @@ function App() {
             ``,
             `${exportPrefix}const makeNodeMaterial = (options = {}) => {`,
             ...(usesTextures ? [`  const textures = options.textures ?? {};`] : []),
-            `  const timeUniform = TSL.uniform(0);`,
+            `  const timeUniform = options.timeUniform ?? TSL.uniform(0);`,
             ...(usesTextures
               ? [`  const textureFromNode = (id) => textures[id] ?? null;`]
               : [`  const textureFromNode = (_id) => null;`]),
@@ -12519,7 +14621,7 @@ function App() {
         : `${exportPrefix}const createApp = (options = {}) => {`
     return [
       signature,
-      `  const { container, textures = {}, geometryType = 'box' } = options;`,
+      `  const { container, textures = {}, geometryType = 'box', timeUniform: injectedTime } = options;`,
       `  if (!container) {`,
       `    throw new Error('Container is required');`,
       `  }`,
@@ -12555,9 +14657,9 @@ function App() {
       `        return new BoxGeometry(1, 1, 1);`,
       `    }`,
       `  })();`,
-      `  const materialResult = makeNodeMaterial({ textures });`,
+      `  const materialResult = makeNodeMaterial({ textures, timeUniform: injectedTime });`,
       `  const material = materialResult?.material ?? materialResult;`,
-      `  const uniforms = materialResult?.uniforms ?? { time: TSL.uniform(0) };`,
+      `  const uniforms = materialResult?.uniforms ?? { time: injectedTime ?? TSL.uniform(0) };`,
       `  const mesh = new Mesh(geometry, material);`,
       `  scene.add(mesh);`,
       `  const controls = new OrbitControls(camera, renderer.domElement);`,
@@ -12685,6 +14787,7 @@ function App() {
             `  container: HTMLElement;`,
             ...(usesTextures ? [`  textures?: Record<string, Texture>;`] : []),
             `  geometryType?: 'box' | 'sphere' | 'plane' | 'torus' | 'cylinder';`,
+            `  timeUniform?: ReturnType<typeof TSL.uniform>;`,
             `};`,
             ``,
           ]
@@ -13222,7 +15325,7 @@ function App() {
       }
       if (vertexPositionNode) {
         const positionNode =
-          vertexPositionNode.kind === 'color'
+          vertexPositionNode.kind === 'vec3' || vertexPositionNode.kind === 'color'
             ? vertexPositionNode.node
             : vec3(
                 vertexPositionNode.node,
@@ -14458,44 +16561,59 @@ function App() {
       }
     }
 
-    const start = async () => {
-      try {
-        if (!WebGPU.isAvailable()) {
-          if (!disposed) {
-            setStatus('WebGPU not available')
-          }
-          return
-        }
-        renderer = new WebGPURenderer({ antialias: true })
-        renderer.setPixelRatio(window.devicePixelRatio)
-        renderer.outputColorSpace = SRGBColorSpace
-        renderer.toneMapping = NoToneMapping
-        renderer.toneMappingExposure = 1
-        rendererRef.current = renderer
-        container.appendChild(renderer.domElement)
-
-        material = new MeshStandardNodeMaterial()
-        materialRef.current = material
-        sceneRef.current = scene
-        const mesh = new Mesh(geometry, material)
-        meshesRef.current = [mesh]
-        geometriesRef.current = [geometry]
-        setMaterialReady(true)
-
-        await renderer.init()
-        const ktx2Loader = new KTX2Loader().setTranscoderPath('/basis/')
-        ktx2Loader.detectSupport(renderer)
-        ktx2LoaderRef.current = ktx2Loader
-        setKtx2Ready(true)
+  const start = async () => {
+    try {
+      if (!disposed) {
+        setStatus('Checking WebGPU...')
+      }
+      if (!WebGPU.isAvailable()) {
         if (!disposed) {
-          setStatus('WebGPU/TSL running')
-        }
-      } catch (error) {
-        if (!disposed) {
-          setStatus('Renderer init failed')
+          setStatus('WebGPU not available')
         }
         return
       }
+      if (!disposed) {
+        setStatus('Creating renderer...')
+      }
+      renderer = new WebGPURenderer({ antialias: true })
+      renderer.setPixelRatio(window.devicePixelRatio)
+      renderer.outputColorSpace = SRGBColorSpace
+      renderer.toneMapping = NoToneMapping
+      renderer.toneMappingExposure = 1
+      rendererRef.current = renderer
+      container.appendChild(renderer.domElement)
+
+      if (!disposed) {
+        setStatus('Initializing scene...')
+      }
+      material = new MeshStandardNodeMaterial()
+      materialRef.current = material
+      sceneRef.current = scene
+        const mesh = new Mesh(geometry, material)
+        meshesRef.current = [mesh]
+      geometriesRef.current = [geometry]
+      setMaterialReady(true)
+
+      if (!disposed) {
+        setStatus('Initializing renderer...')
+      }
+      await renderer.init()
+      if (!disposed) {
+        setStatus('Loading texture support...')
+      }
+      const ktx2Loader = new KTX2Loader().setTranscoderPath('/basis/')
+      ktx2Loader.detectSupport(renderer)
+      ktx2LoaderRef.current = ktx2Loader
+      setKtx2Ready(true)
+      if (!disposed) {
+        setStatus('Compiling shaders...')
+      }
+    } catch (error) {
+      if (!disposed) {
+        setStatus('Renderer init failed')
+      }
+      return
+    }
 
       meshesRef.current.forEach((mesh) => scene.add(mesh))
       resize()
@@ -14504,9 +16622,16 @@ function App() {
     const startTime = performance.now()
     let lastTick = startTime
     let frames = 0
+    let firstFrame = true
     renderer.setAnimationLoop(() => {
       timeUniformRef.current.value = (performance.now() - startTime) / 1000
       renderer?.render(scene, camera)
+      if (firstFrame) {
+        if (!disposed) {
+          setStatus('WebGPU/TSL running')
+        }
+        firstFrame = false
+      }
       frames += 1
       const now = performance.now()
       if (now - lastTick > 1000) {
@@ -14548,6 +16673,14 @@ function App() {
     <div className="app">
       <aside className="sidebar">
         <h1>TSL Node Editor</h1>
+        <a
+          className="project-link"
+          href="https://github.com/takahirox/tsl-node-editor"
+          target="_blank"
+          rel="noreferrer"
+        >
+          GitHub Project
+        </a>
         <div className="status">
           <div className="dot" />
           {status}
@@ -14770,19 +16903,123 @@ function App() {
         </section>
         <section className="panel">
           <h2>Storage</h2>
-          <div className="button-row">
-            <button className="palette-button" type="button" onClick={saveGraph}>
-              Save Graph
-            </button>
-            <button className="palette-button" type="button" onClick={loadGraph}>
-              Load Graph
+          <div className="slot-row">
+            <label className="export-format">
+              <span>Active slot</span>
+              <select
+                className="palette-select"
+                value={storageSlot}
+                onChange={(event) => setStorageSlot(event.target.value)}
+              >
+                {storageSlots.map((slot) => (
+                  <option key={slot} value={slot}>
+                    {slot}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="button-row slot-actions">
+            <button
+              className="palette-button danger compact"
+              type="button"
+              disabled={storageSlot === 'default'}
+              onClick={async () => {
+                const target = normalizeSlot(storageSlot)
+                if (target === 'default') return
+                if (!window.confirm(`Delete slot "${target}"?`)) return
+                if (target === storageSlot) {
+                  const fallback =
+                    storageSlots.find((slot) => slot !== target) ?? 'default'
+                  isHydratingRef.current = true
+                  await deleteSlot(target)
+                  setStorageSlot(fallback)
+                  return
+                }
+                await deleteSlot(target)
+              }}
+            >
+              Delete Slot
             </button>
             <button
-              className="palette-button danger"
+              className="palette-button danger compact"
               type="button"
-              onClick={clearSavedGraph}
+              onClick={async () => {
+                const target = normalizeSlot(storageSlot)
+                if (!window.confirm(`Clear slot "${target}"?`)) return
+                await clearSlot(target)
+                Object.values(objectUrlRef.current).forEach((url) => URL.revokeObjectURL(url))
+                objectUrlRef.current = {}
+                setActiveFunctionId(null)
+                setNodes([])
+                setConnections([])
+                setGroups([])
+                setFunctions({})
+                setSelectedNodeIds([])
+                setToast(`Cleared slot "${target}"`)
+              }}
             >
-              Clear Saved
+              Clear Slot
+            </button>
+          </div>
+          <div className="slot-row">
+            <input
+              className="palette-input"
+              placeholder="New slot"
+              value={newSlotName}
+              onChange={(event) => setNewSlotName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter') return
+                const next = normalizeSlot(newSlotName)
+                if (!next) return
+                const examplePalette = {
+                  ...paletteDefaults,
+                  ...(exampleGraph.ui?.paletteOpen ?? {}),
+                }
+                void writeGraphRecord(
+                  next,
+                  {
+                    nodes: exampleGraph.nodes as GraphNode[],
+                    connections: exampleGraph.connections as GraphConnection[],
+                    groups: (exampleGraph.groups ?? []) as GraphGroup[],
+                    functions: (exampleGraph.functions ?? {}) as Record<string, FunctionDefinition>,
+                    ui: { paletteOpen: examplePalette },
+                  },
+                  { silent: true },
+                )
+                pendingExampleLayoutRef.current = true
+                setStorageSlot(next)
+                setNewSlotName('')
+              }}
+            />
+            <button
+              className="palette-button"
+              type="button"
+              onClick={async () => {
+                const next = normalizeSlot(newSlotName)
+                if (!next) return
+                const examplePalette = {
+                  ...paletteDefaults,
+                  ...(exampleGraph.ui?.paletteOpen ?? {}),
+                }
+                await writeGraphRecord(
+                  next,
+                  {
+                    nodes: exampleGraph.nodes as GraphNode[],
+                    connections: exampleGraph.connections as GraphConnection[],
+                    groups: (exampleGraph.groups ?? []) as GraphGroup[],
+                    functions: (exampleGraph.functions ?? {}) as Record<string, FunctionDefinition>,
+                    ui: { paletteOpen: examplePalette },
+                  },
+                  { silent: true },
+                )
+                pendingExampleLayoutRef.current = true
+                setStorageSlot(next)
+                setNewSlotName('')
+              }}
+              disabled={!newSlotName.trim()}
+            >
+              Create
             </button>
           </div>
         </section>

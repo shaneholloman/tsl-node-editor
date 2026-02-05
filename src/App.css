@@ -25,6 +25,22 @@
   text-transform: uppercase;
 }
 
+.project-link {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: none;
+  color: rgba(170, 196, 220, 0.85);
+  text-decoration: none;
+}
+
+.project-link:hover {
+  color: rgba(235, 241, 248, 0.95);
+}
+
 .sidebar p {
   margin: 0;
   font-size: 0.95rem;
@@ -125,9 +141,22 @@
   transition: border-color 0.2s, transform 0.2s;
 }
 
+.palette-button.compact {
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  line-height: 1.1;
+  text-align: center;
+}
+
 .palette-button:hover {
   border-color: rgba(122, 189, 255, 0.7);
   transform: translateY(-1px);
+}
+
+.palette-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .palette-button.danger {
@@ -152,6 +181,16 @@
   cursor: pointer;
 }
 
+.palette-input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(12, 16, 24, 0.9);
+  color: rgba(230, 235, 242, 0.88);
+  padding: 8px 10px;
+  font-size: 0.75rem;
+}
+
 .export-format {
   display: flex;
   justify-content: space-between;
@@ -167,6 +206,19 @@
 
 .export-format.disabled {
   opacity: 0.5;
+}
+
+.slot-row {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.slot-actions {
+  margin-top: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 
