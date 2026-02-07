@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import {
   AmbientLight,
@@ -539,6 +539,7 @@ function App() {
   const dragRef = useRef<{
     ids: string[]
     offsets: Record<string, { x: number; y: number }>
+    elements?: Record<string, HTMLElement>
   } | null>(null)
   const groupDragRef = useRef<{
     id: string
@@ -547,6 +548,13 @@ function App() {
     moved: boolean
   } | null>(null)
   const groupClickSuppressRef = useRef<{ id: string } | null>(null)
+  const isDraggingNodesRef = useRef(false)
+  const dragRafRef = useRef<number | null>(null)
+  const dragPointerRef = useRef<{ clientX: number; clientY: number } | null>(null)
+  const panRafRef = useRef<number | null>(null)
+  const panPointerRef = useRef<{ clientX: number; clientY: number } | null>(null)
+  const nodeWorldRef = useRef<HTMLDivElement | null>(null)
+  const nodeLinksRef = useRef<SVGSVGElement | null>(null)
   const viewerRef = useRef<HTMLIFrameElement | null>(null)
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([])
   const [connections, setConnections] = useState<GraphConnection[]>([])
@@ -631,6 +639,7 @@ function App() {
   const [newSlotName, setNewSlotName] = useState('')
   const historyBySlotRef = useRef<Record<string, HistoryState>>({})
   const historySlotRef = useRef(storageSlot)
+  const historyRecordingEnabled = true // Temporary toggle for drag hitch profiling
 
   const lastSlotStorageKey = 'tsl-node-editor:last-slot'
   const autoSaveTimerRef = useRef<number | null>(null)
@@ -640,6 +649,16 @@ function App() {
   const dbName = 'tsl-node-editor'
   const graphSchemaVersion = 2
   const dbVersion = 2
+
+  const applyViewportTransform = useCallback((next: { x: number; y: number; zoom: number }) => {
+    const transform = `translate(${next.x}px, ${next.y}px) scale(${next.zoom})`
+    if (nodeWorldRef.current) {
+      nodeWorldRef.current.style.transform = transform
+    }
+    if (nodeLinksRef.current) {
+      nodeLinksRef.current.style.transform = transform
+    }
+  }, [])
 
   const basePalette = useMemo<PaletteItem[]>(
     () => [
@@ -1991,6 +2010,34 @@ function App() {
   useEffect(() => {
     setPaletteOpen((prev) => ({ ...paletteDefaults, ...prev }))
   }, [paletteDefaults])
+
+  const allPaletteOpen = useMemo(
+    () =>
+      Object.fromEntries(paletteGroups.map((group) => [group.id, true])) as Record<
+        string,
+        boolean
+      >,
+    [paletteGroups],
+  )
+
+  const allPaletteClosed = useMemo(
+    () =>
+      Object.fromEntries(paletteGroups.map((group) => [group.id, false])) as Record<
+        string,
+        boolean
+      >,
+    [paletteGroups],
+  )
+
+  const isPaletteAllExpanded = useMemo(
+    () => paletteGroups.every((group) => paletteOpen[group.id]),
+    [paletteGroups, paletteOpen],
+  )
+
+  const isPaletteAllCollapsed = useMemo(
+    () => paletteGroups.every((group) => !paletteOpen[group.id]),
+    [paletteGroups, paletteOpen],
+  )
 
   const exampleGraph = useMemo<ExampleGraph>(
     () => ({
@@ -3929,7 +3976,7 @@ function App() {
   }, [storageSlot])
 
   useEffect(() => {
-    if (isHydratingRef.current) return
+    if (isHydratingRef.current || isDraggingNodesRef.current) return
     if (autoSaveTimerRef.current) {
       window.clearTimeout(autoSaveTimerRef.current)
     }
@@ -4424,96 +4471,157 @@ function App() {
   const isNodeInCollapsedGroup = (nodeId: string) =>
     editorGroups.some((group) => group.collapsed && group.nodeIds.includes(nodeId))
 
-  useLayoutEffect(() => {
+  useEffect(() => {
     if (isFunctionEditing) {
       setGroupBounds((prev) => (Object.keys(prev).length ? {} : prev))
       return
     }
     const container = viewportRef.current
     if (!container) return
-    const rect = container.getBoundingClientRect()
-    const next: Record<string, { x: number; y: number }> = {}
-    const sizeMap: Record<string, { width: number; height: number }> = {}
-    const pins = container.querySelectorAll<HTMLElement>('[data-pin-key]')
-    pins.forEach((pin) => {
-      const pinRect = pin.getBoundingClientRect()
-      const key = pin.dataset.pinKey
-      if (!key) return
-      next[key] = {
-        x: pinRect.left - rect.left + pinRect.width / 2,
-        y: pinRect.top - rect.top + pinRect.height / 2,
-      }
-    })
-    const cards = container.querySelectorAll<HTMLElement>('.node-card[data-node-id]')
-    const scale = view.zoom || 1
-    cards.forEach((card) => {
-      const id = card.dataset.nodeId
-      if (!id) return
-      const rect = card.getBoundingClientRect()
-      const width = card.offsetWidth || rect.width / scale
-      const height = card.offsetHeight || rect.height / scale
-      sizeMap[id] = {
-        width,
-        height,
-      }
-    })
-    nodeSizeRef.current = sizeMap
-    setPinPositions(next)
-    if (!isFunctionEditing && pendingExampleLayoutRef.current) {
-      pendingExampleLayoutRef.current = false
-      setEditorNodes((prev) => spreadNodesByColumn(prev))
-    }
-    if (!groups.length) {
-      setGroupBounds((prev) => (Object.keys(prev).length ? {} : prev))
-      return
-    }
-    const nodeMap = new Map(nodes.map((node) => [node.id, node]))
-    const fallbackSize = { width: 200, height: 160 }
-    const padding = 16
-    const nextBounds: Record<
-      string,
-      { x: number; y: number; width: number; height: number }
-    > = {}
-    groups.forEach((group) => {
-      const members = group.nodeIds
-        .map((id) => {
-          const node = nodeMap.get(id)
-          if (!node) return null
-          const size = sizeMap[id] ?? fallbackSize
-          return { x: node.x, y: node.y, width: size.width, height: size.height }
-        })
-        .filter(
-          (member): member is { x: number; y: number; width: number; height: number } =>
-            Boolean(member),
-        )
-      if (!members.length) return
-      let minX = Infinity
-      let minY = Infinity
-      let maxX = -Infinity
-      let maxY = -Infinity
-      members.forEach((member) => {
-        minX = Math.min(minX, member.x)
-        minY = Math.min(minY, member.y)
-        maxX = Math.max(maxX, member.x + member.width)
-        maxY = Math.max(maxY, member.y + member.height)
+    const rafId = window.requestAnimationFrame(() => {
+      const rect = container.getBoundingClientRect()
+      const viewState = viewRef.current
+      const next: Record<string, { x: number; y: number }> = {}
+      let sizeMap = nodeSizeRef.current
+      const pins = container.querySelectorAll<HTMLElement>('[data-pin-key]')
+      pins.forEach((pin) => {
+        const pinRect = pin.getBoundingClientRect()
+        const key = pin.dataset.pinKey
+        if (!key) return
+        const screenX = pinRect.left - rect.left + pinRect.width / 2
+        const screenY = pinRect.top - rect.top + pinRect.height / 2
+        next[key] = {
+          x: (screenX - viewState.x) / viewState.zoom,
+          y: (screenY - viewState.y) / viewState.zoom,
+        }
       })
-      nextBounds[group.id] = {
-        x: minX - padding,
-        y: minY - padding,
-        width: maxX - minX + padding * 2,
-        height: maxY - minY + padding * 2,
+      const needsNodeSizeMeasure =
+        Object.keys(sizeMap).length !== editorNodes.length ||
+        editorNodes.some((node) => !sizeMap[node.id])
+      if (needsNodeSizeMeasure) {
+        const nextSizeMap: Record<string, { width: number; height: number }> = {}
+        const cards = container.querySelectorAll<HTMLElement>('.node-card[data-node-id]')
+        cards.forEach((card) => {
+          const id = card.dataset.nodeId
+          if (!id) return
+          const rect = card.getBoundingClientRect()
+          const width = card.offsetWidth || rect.width
+          const height = card.offsetHeight || rect.height
+          nextSizeMap[id] = {
+            width,
+            height,
+          }
+        })
+        sizeMap = nextSizeMap
+        nodeSizeRef.current = nextSizeMap
       }
+      setPinPositions(next)
+      if (!isFunctionEditing && pendingExampleLayoutRef.current) {
+        pendingExampleLayoutRef.current = false
+        setEditorNodes((prev) => spreadNodesByColumn(prev))
+      }
+      if (!groups.length) {
+        setGroupBounds((prev) => (Object.keys(prev).length ? {} : prev))
+        return
+      }
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]))
+      const fallbackSize = { width: 200, height: 160 }
+      const padding = 16
+      const nextBounds: Record<
+        string,
+        { x: number; y: number; width: number; height: number }
+      > = {}
+      groups.forEach((group) => {
+        const members = group.nodeIds
+          .map((id) => {
+            const node = nodeMap.get(id)
+            if (!node) return null
+            const size = sizeMap[id] ?? fallbackSize
+            return { x: node.x, y: node.y, width: size.width, height: size.height }
+          })
+          .filter(
+            (member): member is { x: number; y: number; width: number; height: number } =>
+              Boolean(member),
+          )
+        if (!members.length) return
+        let minX = Infinity
+        let minY = Infinity
+        let maxX = -Infinity
+        let maxY = -Infinity
+        members.forEach((member) => {
+          minX = Math.min(minX, member.x)
+          minY = Math.min(minY, member.y)
+          maxX = Math.max(maxX, member.x + member.width)
+          maxY = Math.max(maxY, member.y + member.height)
+        })
+        nextBounds[group.id] = {
+          x: minX - padding,
+          y: minY - padding,
+          width: maxX - minX + padding * 2,
+          height: maxY - minY + padding * 2,
+        }
+      })
+      setGroupBounds(nextBounds)
     })
-    setGroupBounds(nextBounds)
+    return () => window.cancelAnimationFrame(rafId)
   }, [
     nodes,
     connections,
-    linkDraft,
-    view,
     groups,
     isFunctionEditing,
     spreadNodesByColumn,
   ])
+
+  const nodeIdSignature = useMemo(
+    () => nodes.map((node) => node.id).join('|'),
+    [nodes],
+  )
+
+  const uniformInputSignature = useMemo(
+    () =>
+      JSON.stringify(
+        nodes
+          .filter((node) => node.type === 'number' || node.type === 'color')
+          .map((node) => ({
+            id: node.id,
+            type: node.type,
+            value: node.value ?? '',
+          })),
+      ),
+    [nodes],
+  )
+
+  const textureSourceSignature = useMemo(
+    () =>
+      JSON.stringify(
+        nodes
+          .filter((node) => node.type === 'texture')
+          .map((node) => ({
+            id: node.id,
+            src: typeof node.value === 'string' ? node.value : '',
+          })),
+      ),
+    [nodes],
+  )
+
+  const gltfSourceSignature = useMemo(
+    () =>
+      JSON.stringify(
+        nodes
+          .filter(
+            (node) =>
+              node.type === 'gltf' ||
+              node.type === 'gltfMaterial' ||
+              node.type === 'gltfTexture',
+          )
+          .map((node) => ({
+            id: node.id,
+            type: node.type,
+            src: typeof node.value === 'string' ? node.value : '',
+          })),
+      ),
+    [nodes],
+  )
 
   useEffect(() => {
     nodesRef.current = editorNodes
@@ -4546,7 +4654,7 @@ function App() {
         })
       return same ? prev : next
     })
-  }, [nodes])
+  }, [nodeIdSignature])
 
   useEffect(() => {
     viewRef.current = view
@@ -4711,6 +4819,8 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!historyRecordingEnabled) return
+    if (isDraggingNodesRef.current) return
     const snapshot = { nodes, connections, groups, functions }
     const signature = JSON.stringify(snapshot)
     const history = historyRef.current
@@ -4755,7 +4865,7 @@ function App() {
         historyTimerRef.current = null
       }
     }
-  }, [nodes, connections, groups, functions])
+  }, [nodes, connections, groups, functions, historyRecordingEnabled])
 
   useEffect(() => {
   const handleKeyDown = (event: KeyboardEvent) => {
@@ -5127,6 +5237,27 @@ function App() {
     return JSON.stringify({ nodeShape, linkShape, gltfVersion, functionShape })
   }, [nodes, connections, gltfVersion, functions])
 
+  const graphComputeSignature = useMemo(() => {
+    const normalizedNodes = nodes.map((node) => {
+      const { x: _x, y: _y, ...rest } = node
+      return rest
+    })
+    const normalizedFunctions = Object.values(functions).map((fn) => ({
+      ...fn,
+      nodes: fn.nodes.map((node) => {
+        const { x: _x, y: _y, ...rest } = node
+        return rest
+      }),
+    }))
+    return JSON.stringify({
+      nodes: normalizedNodes,
+      connections,
+      functions: normalizedFunctions,
+      gltfVersion,
+      textureVersion,
+    })
+  }, [nodes, connections, functions, gltfVersion, textureVersion])
+
   const geometrySignature = useMemo(() => {
     const expanded = expandFunctions(nodes, connections, functions)
     const geometryNodes = expanded.nodes
@@ -5159,6 +5290,14 @@ function App() {
       .map((node) => ({ id: node.id, value: node.value ?? '' }))
     return JSON.stringify({ textures, version: textureVersion })
   }, [nodes, connections, functions, textureVersion])
+
+  const editorGraphSignature = useMemo(() => {
+    const normalizedNodes = editorNodes.map((node) => {
+      const { x: _x, y: _y, ...rest } = node
+      return rest
+    })
+    return JSON.stringify({ nodes: normalizedNodes, connections: editorConnections })
+  }, [editorNodes, editorConnections])
 
   const applyNumberUniformUpdate = (
     uniformNode: ReturnType<typeof uniform>,
@@ -14805,16 +14944,16 @@ function App() {
 
   useEffect(() => {
     codePreviewRef.current = buildCodePreview()
-  }, [nodes, connections, functions])
+  }, [graphComputeSignature])
 
-  const executableTSL = useMemo(() => buildExecutableTSL(), [nodes, connections, functions])
+  const executableTSL = useMemo(() => buildExecutableTSL(), [graphComputeSignature])
   const materialExport = useMemo(
     () => buildMaterialExport(executableTSL, exportFormat, 'module'),
-    [nodes, connections, functions, executableTSL, exportFormat],
+    [graphComputeSignature, executableTSL, exportFormat],
   )
   const appExport = useMemo(
     () => buildAppExport(executableTSL, exportFormat, 'module'),
-    [nodes, connections, functions, executableTSL, exportFormat],
+    [graphComputeSignature, executableTSL, exportFormat],
   )
   const appRuntime = useMemo(
     () => {
@@ -14851,7 +14990,7 @@ function App() {
       ].join('\n')
       return [runtimeHeader, materialSnippet, '', appBody].join('\n')
     },
-    [nodes, executableTSL],
+    [graphComputeSignature, executableTSL],
   )
   const tslOutput = useMemo(() => {
     switch (tslOutputKind) {
@@ -14964,7 +15103,7 @@ function App() {
       }
     })
     return payload
-  }, [nodes, connections, functions, gltfVersion])
+  }, [graphComputeSignature, gltfVersion])
   const viewerGeometryType = useMemo(() => {
     const expanded = expandFunctions(nodes, connections, functions)
     const nodeMap = buildNodeMap(expanded.nodes)
@@ -14981,7 +15120,7 @@ function App() {
       }
     }
     return 'box'
-  }, [nodes, connections, functions])
+  }, [graphComputeSignature])
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -15340,7 +15479,7 @@ function App() {
     }
     graphSignatureRef.current = graphSignature
     textureSignatureRef.current = textureSignature
-  }, [nodes, connections, materialReady, graphSignature, textureSignature])
+  }, [materialReady, graphSignature, textureSignature])
 
   useEffect(() => {
     const scene = sceneRef.current
@@ -15391,7 +15530,7 @@ function App() {
     meshesRef.current.forEach((mesh) => scene.add(mesh))
     geometriesRef.current.forEach((geometry) => geometry.dispose())
     geometriesRef.current = nextGeometries
-  }, [geometrySignature, nodes, connections, functions])
+  }, [geometrySignature])
 
   useEffect(() => {
     const nodeMap = buildNodeMap(nodes)
@@ -15407,7 +15546,7 @@ function App() {
         }
       }
     })
-  }, [nodes])
+  }, [uniformInputSignature])
 
   useEffect(() => {
     const nodeMap = buildNodeMap(editorNodes)
@@ -15782,7 +15921,7 @@ function App() {
     })
 
     setTypeWarnings(warn)
-  }, [editorNodes, editorConnections, inputTypes])
+  }, [editorGraphSignature, inputTypes])
 
   useEffect(() => {
     const loader = new TextureLoader()
@@ -15838,7 +15977,7 @@ function App() {
     if (changed) {
       setTextureVersion((prev) => prev + 1)
     }
-  }, [nodes, ktx2Ready])
+  }, [textureSourceSignature, ktx2Ready])
 
   useEffect(() => {
     if (!ktx2Ready) return
@@ -15927,22 +16066,25 @@ function App() {
     if (changed) {
       setGltfVersion((prev) => prev + 1)
     }
-  }, [nodes, ktx2Ready])
+  }, [gltfSourceSignature, ktx2Ready])
 
   useEffect(() => {
     const handleResize = () => {
       const container = viewportRef.current
       if (!container) return
       const rect = container.getBoundingClientRect()
+      const viewState = viewRef.current
       const next: Record<string, { x: number; y: number }> = {}
       const pins = container.querySelectorAll<HTMLElement>('[data-pin-key]')
       pins.forEach((pin) => {
         const pinRect = pin.getBoundingClientRect()
         const key = pin.dataset.pinKey
         if (!key) return
+        const screenX = pinRect.left - rect.left + pinRect.width / 2
+        const screenY = pinRect.top - rect.top + pinRect.height / 2
         next[key] = {
-          x: pinRect.left - rect.left + pinRect.width / 2,
-          y: pinRect.top - rect.top + pinRect.height / 2,
+          x: (screenX - viewState.x) / viewState.zoom,
+          y: (screenY - viewState.y) / viewState.zoom,
         }
       })
       setPinPositions(next)
@@ -15955,6 +16097,24 @@ function App() {
   useEffect(() => {
     overlayOpenRef.current = showCode
     if (showCode) {
+      if (dragRafRef.current !== null) {
+        window.cancelAnimationFrame(dragRafRef.current)
+        dragRafRef.current = null
+      }
+      if (panRafRef.current !== null) {
+        window.cancelAnimationFrame(panRafRef.current)
+        panRafRef.current = null
+      }
+      const drag = dragRef.current
+      if (drag?.elements) {
+        Object.values(drag.elements).forEach((element) => {
+          element.style.willChange = ''
+          element.style.transform = ''
+        })
+      }
+      dragPointerRef.current = null
+      panPointerRef.current = null
+      isDraggingNodesRef.current = false
       dragRef.current = null
       groupDragRef.current = null
       panRef.current = null
@@ -15967,13 +16127,136 @@ function App() {
     const container = viewportRef.current
     if (!container) return
 
+    const updateDraggedLinkPaths = (draggedIds: Set<string>) => {
+      const svg = container.querySelector<SVGSVGElement>('.node-links')
+      if (!svg) return
+      const rect = container.getBoundingClientRect()
+      const viewState = viewRef.current
+      const paths = svg.querySelectorAll<SVGPathElement>('path[data-link-id]')
+      paths.forEach((pathEl) => {
+        const fromNodeId = pathEl.dataset.fromNodeId
+        const toNodeId = pathEl.dataset.toNodeId
+        const fromPin = pathEl.dataset.fromPin
+        const toPin = pathEl.dataset.toPin
+        if (!fromNodeId || !toNodeId || !fromPin || !toPin) return
+        if (!draggedIds.has(fromNodeId) && !draggedIds.has(toNodeId)) return
+        const fromKey = `${fromNodeId}:output:${fromPin}`
+        const toKey = `${toNodeId}:input:${toPin}`
+        const fromEl = container.querySelector<HTMLElement>(`[data-pin-key="${fromKey}"]`)
+        const toEl = container.querySelector<HTMLElement>(`[data-pin-key="${toKey}"]`)
+        if (!fromEl || !toEl) return
+        const fromRect = fromEl.getBoundingClientRect()
+        const toRect = toEl.getBoundingClientRect()
+        const fromScreenX = fromRect.left - rect.left + fromRect.width / 2
+        const fromScreenY = fromRect.top - rect.top + fromRect.height / 2
+        const toScreenX = toRect.left - rect.left + toRect.width / 2
+        const toScreenY = toRect.top - rect.top + toRect.height / 2
+        const from = {
+          x: (fromScreenX - viewState.x) / viewState.zoom,
+          y: (fromScreenY - viewState.y) / viewState.zoom,
+        }
+        const to = {
+          x: (toScreenX - viewState.x) / viewState.zoom,
+          y: (toScreenY - viewState.y) / viewState.zoom,
+        }
+        const dx = Math.max(60, Math.abs(to.x - from.x) * 0.4)
+        pathEl.setAttribute(
+          'd',
+          `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`,
+        )
+      })
+    }
+
+    const applyDragPreview = (clientX: number, clientY: number) => {
+      const drag = dragRef.current
+      if (!drag) return
+      const rect = container.getBoundingClientRect()
+      const viewState = viewRef.current
+      const worldX = (clientX - rect.left - viewState.x) / viewState.zoom
+      const worldY = (clientY - rect.top - viewState.y) / viewState.zoom
+      drag.ids.forEach((id) => {
+        const offset = drag.offsets[id]
+        if (!offset) return
+        const element =
+          drag.elements?.[id] ??
+          container.querySelector<HTMLElement>(`.node-card[data-node-id="${id}"]`)
+        if (!element) return
+        if (!drag.elements) {
+          drag.elements = {}
+        }
+        drag.elements[id] = element
+        element.style.willChange = 'transform'
+        element.style.transform = `translate(${worldX - offset.x}px, ${worldY - offset.y}px)`
+      })
+      updateDraggedLinkPaths(new Set(drag.ids))
+    }
+
+    const clearDragPreview = () => {
+      const drag = dragRef.current
+      if (!drag?.elements) return
+      Object.values(drag.elements).forEach((element) => {
+        element.style.willChange = ''
+        element.style.transform = ''
+      })
+    }
+
+    const commitDragUpdate = (clientX: number, clientY: number) => {
+      const drag = dragRef.current
+      if (!drag) return
+      const rect = container.getBoundingClientRect()
+      const viewState = viewRef.current
+      const worldX = (clientX - rect.left - viewState.x) / viewState.zoom
+      const worldY = (clientY - rect.top - viewState.y) / viewState.zoom
+      const draggedIds = new Set(drag.ids)
+      setEditorNodesRef.current((prev) =>
+        prev.map((node) => {
+          if (!draggedIds.has(node.id)) return node
+          const offset = drag.offsets[node.id]
+          if (!offset) return node
+          return {
+            ...node,
+            x: worldX - offset.x,
+            y: worldY - offset.y,
+          }
+        }),
+      )
+    }
+
+    const scheduleDragUpdate = (clientX: number, clientY: number) => {
+      dragPointerRef.current = { clientX, clientY }
+      if (dragRafRef.current !== null) return
+      dragRafRef.current = window.requestAnimationFrame(() => {
+        dragRafRef.current = null
+        const pointer = dragPointerRef.current
+        if (!pointer) return
+        applyDragPreview(pointer.clientX, pointer.clientY)
+      })
+    }
+
+    const schedulePanUpdate = (clientX: number, clientY: number) => {
+      panPointerRef.current = { clientX, clientY }
+      if (panRafRef.current !== null) return
+      panRafRef.current = window.requestAnimationFrame(() => {
+        panRafRef.current = null
+        const pan = panRef.current
+        const pointer = panPointerRef.current
+        if (!pan || !pointer) return
+        const viewState = viewRef.current
+        const nextX = pan.originX + (pointer.clientX - pan.startX)
+        const nextY = pan.originY + (pointer.clientY - pan.startY)
+        if (viewState.x === nextX && viewState.y === nextY) return
+        const nextView = { ...viewState, x: nextX, y: nextY }
+        viewRef.current = nextView
+        applyViewportTransform(nextView)
+      })
+    }
+
     const handlePointerMove = (event: PointerEvent) => {
       if (overlayOpenRef.current) return
       const drag = dragRef.current
       const pan = panRef.current
       if (container) {
         const rect = container.getBoundingClientRect()
-        const viewState = viewRef.current
         const draft = linkDraftRef.current
         if (draft) {
           const next = {
@@ -15985,8 +16268,6 @@ function App() {
           setLinkDraft(next)
         }
         if (drag) {
-          const worldX = (event.clientX - rect.left - viewState.x) / viewState.zoom
-          const worldY = (event.clientY - rect.top - viewState.y) / viewState.zoom
           if (groupDragRef.current && !groupDragRef.current.moved) {
             const dx = event.clientX - groupDragRef.current.startX
             const dy = event.clientY - groupDragRef.current.startY
@@ -15994,28 +16275,26 @@ function App() {
               groupDragRef.current.moved = true
             }
           }
-          setEditorNodesRef.current((prev) =>
-            prev.map((node) => {
-              if (!drag.ids.includes(node.id)) return node
-              const offset = drag.offsets[node.id]
-              if (!offset) return node
-              return {
-                ...node,
-                x: worldX - offset.x,
-                y: worldY - offset.y,
-              }
-            }),
-          )
+          scheduleDragUpdate(event.clientX, event.clientY)
         }
         if (pan) {
-          const nextX = pan.originX + (event.clientX - pan.startX)
-          const nextY = pan.originY + (event.clientY - pan.startY)
-          setView((prev) => ({ ...prev, x: nextX, y: nextY }))
+          schedulePanUpdate(event.clientX, event.clientY)
         }
       }
     }
 
     const handlePointerUp = (event: PointerEvent) => {
+      const hadPan = Boolean(panRef.current)
+      const hadNodeDrag = Boolean(dragRef.current)
+      if (hadNodeDrag) {
+        if (dragRafRef.current !== null) {
+          window.cancelAnimationFrame(dragRafRef.current)
+          dragRafRef.current = null
+        }
+        clearDragPreview()
+        commitDragUpdate(event.clientX, event.clientY)
+        dragPointerRef.current = null
+      }
       const draft = linkDraftRef.current
       if (draft) {
         const target = event.target as HTMLElement | null
@@ -16460,11 +16739,22 @@ function App() {
         setLinkDraft(null)
       }
       dragRef.current = null
+      if (hadNodeDrag) {
+        isDraggingNodesRef.current = false
+      }
       if (groupDragRef.current?.moved) {
         groupClickSuppressRef.current = { id: groupDragRef.current.id }
       }
       groupDragRef.current = null
       panRef.current = null
+      if (hadPan) {
+        if (panRafRef.current !== null) {
+          window.cancelAnimationFrame(panRafRef.current)
+          panRafRef.current = null
+        }
+        panPointerRef.current = null
+        setView(viewRef.current)
+      }
     }
 
     const handlePointerDown = (event: PointerEvent) => {
@@ -16501,13 +16791,19 @@ function App() {
         const factor = nextZoom / viewState.zoom
         const nextX = cursorX - (cursorX - viewState.x) * factor
         const nextY = cursorY - (cursorY - viewState.y) * factor
-        setView({ x: nextX, y: nextY, zoom: nextZoom })
+        const nextView = { x: nextX, y: nextY, zoom: nextZoom }
+        viewRef.current = nextView
+        applyViewportTransform(nextView)
+        setView(nextView)
       } else {
-        setView((prev) => ({
-          ...prev,
-          x: prev.x - event.deltaX,
-          y: prev.y - event.deltaY,
-        }))
+        const nextView = {
+          ...viewState,
+          x: viewState.x - event.deltaX,
+          y: viewState.y - event.deltaY,
+        }
+        viewRef.current = nextView
+        applyViewportTransform(nextView)
+        setView(nextView)
       }
     }
 
@@ -16518,13 +16814,22 @@ function App() {
     window.addEventListener('pointercancel', handlePointerUp)
 
     return () => {
+      if (dragRafRef.current !== null) {
+        window.cancelAnimationFrame(dragRafRef.current)
+        dragRafRef.current = null
+      }
+      if (panRafRef.current !== null) {
+        window.cancelAnimationFrame(panRafRef.current)
+        panRafRef.current = null
+      }
+      clearDragPreview()
       container.removeEventListener('pointerdown', handlePointerDown)
       container.removeEventListener('wheel', handleWheel)
       window.removeEventListener('pointermove', handlePointerMove)
       window.removeEventListener('pointerup', handlePointerUp)
       window.removeEventListener('pointercancel', handlePointerUp)
     }
-  }, [])
+  }, [applyViewportTransform])
 
   useEffect(() => {
     const container = viewportRef.current
@@ -16637,9 +16942,7 @@ function App() {
       if (now - lastTick > 1000) {
         const fps = Math.round((frames * 1000) / (now - lastTick))
         if (!disposed) {
-          setStatus((prev) =>
-            prev.includes('WebGPU') ? `${prev.split(' (')[0]} (${fps} fps)` : prev,
-          )
+          setStatus(`WebGPU/TSL running (${fps} fps)`)
         }
         lastTick = now
         frames = 0
@@ -16668,6 +16971,8 @@ function App() {
       }
     }
   }, [])
+
+  const displayView = panRef.current ? viewRef.current : view
 
   return (
     <div className="app">
@@ -16808,6 +17113,24 @@ function App() {
               value={paletteQuery}
               onChange={(event) => setPaletteQuery(event.target.value)}
             />
+            <div className="button-row slot-actions">
+              <button
+                className="palette-button compact"
+                type="button"
+                onClick={() => setPaletteOpen((prev) => ({ ...prev, ...allPaletteOpen }))}
+                disabled={isPaletteAllExpanded}
+              >
+                Expand All
+              </button>
+              <button
+                className="palette-button compact"
+                type="button"
+                onClick={() => setPaletteOpen((prev) => ({ ...prev, ...allPaletteClosed }))}
+                disabled={isPaletteAllCollapsed}
+              >
+                Collapse All
+              </button>
+            </div>
             {filteredPaletteGroups.map((group) => (
               <div key={group.id} className="palette-group">
                 <button
@@ -17154,7 +17477,14 @@ function App() {
           ) : null}
           {showNodes ? (
             <>
-              <svg className="node-links">
+              <svg
+                ref={nodeLinksRef}
+                className="node-links"
+                style={{
+                  transform: `translate(${displayView.x}px, ${displayView.y}px) scale(${displayView.zoom})`,
+                  transformOrigin: '0 0',
+                }}
+              >
                 {editorConnections.map((link) => {
                   const fromKey = `${link.from.nodeId}:output:${link.from.pin}`
                   const toKey = `${link.to.nodeId}:input:${link.to.pin}`
@@ -17165,22 +17495,32 @@ function App() {
                   const path = `M ${from.x} ${from.y} C ${
                     from.x + dx
                   } ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`
-                  return <path key={link.id} d={path} />
+                  return (
+                    <path
+                      key={link.id}
+                      d={path}
+                      data-link-id={link.id}
+                      data-from-node-id={link.from.nodeId}
+                      data-to-node-id={link.to.nodeId}
+                      data-from-pin={link.from.pin}
+                      data-to-pin={link.to.pin}
+                    />
+                  )
                 })}
                 {linkDraft ? (
                   (() => {
                     const fromKey = `${linkDraft.from.nodeId}:output:${linkDraft.from.pin}`
                     const from = pinPositions[fromKey]
                     if (!from) return null
+                    const draftX = (linkDraft.x - displayView.x) / displayView.zoom
+                    const draftY = (linkDraft.y - displayView.y) / displayView.zoom
                     const dx = Math.max(
                       60,
-                      Math.abs(linkDraft.x - from.x) * 0.4,
+                      Math.abs(draftX - from.x) * 0.4,
                     )
                     const path = `M ${from.x} ${from.y} C ${
                       from.x + dx
-                    } ${from.y}, ${linkDraft.x - dx} ${linkDraft.y}, ${
-                      linkDraft.x
-                    } ${linkDraft.y}`
+                    } ${from.y}, ${draftX - dx} ${draftY}, ${draftX} ${draftY}`
                     return <path className="draft" d={path} />
                   })()
                 ) : null}
@@ -17190,9 +17530,10 @@ function App() {
             <div className="node-empty">No nodes yet</div>
           ) : null}
               <div
+                ref={nodeWorldRef}
                 className="node-world"
                 style={{
-                  transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
+                  transform: `translate(${displayView.x}px, ${displayView.y}px) scale(${displayView.zoom})`,
                 }}
               >
                 {editorGroups.map((group) => {
@@ -17231,6 +17572,7 @@ function App() {
                           moved: false,
                         }
                         const offsets: Record<string, { x: number; y: number }> = {}
+                        const elements: Record<string, HTMLElement> = {}
                         group.nodeIds.forEach((id) => {
                           const selectedNode = nodes.find((entry) => entry.id === id)
                           if (!selectedNode) return
@@ -17238,11 +17580,19 @@ function App() {
                             x: worldX - selectedNode.x,
                             y: worldY - selectedNode.y,
                           }
+                          const element = container.querySelector<HTMLElement>(
+                            `.node-card[data-node-id="${id}"]`,
+                          )
+                          if (element) {
+                            elements[id] = element
+                          }
                         })
                         dragRef.current = {
                           ids: group.nodeIds,
                           offsets,
+                          elements,
                         }
+                        isDraggingNodesRef.current = true
                       }}
                       onClick={(event) => {
                         event.stopPropagation()
@@ -17408,6 +17758,7 @@ function App() {
                             ? selectedNodeIds
                             : [node.id]
                         const offsets: Record<string, { x: number; y: number }> = {}
+                        const elements: Record<string, HTMLElement> = {}
                         selected.forEach((id) => {
                           const selectedNode = editorNodes.find((entry) => entry.id === id)
                           if (!selectedNode) return
@@ -17415,11 +17766,19 @@ function App() {
                             x: worldX - selectedNode.x,
                             y: worldY - selectedNode.y,
                           }
+                          const element = container.querySelector<HTMLElement>(
+                            `.node-card[data-node-id="${id}"]`,
+                          )
+                          if (element) {
+                            elements[id] = element
+                          }
                         })
                         dragRef.current = {
                           ids: selected,
                           offsets,
+                          elements,
                         }
+                        isDraggingNodesRef.current = true
                       }}
                     >
               <div className={`node-header${node.type === 'function' ? ' node-header-function' : ''}`}>
